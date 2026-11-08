@@ -79,6 +79,8 @@ module kodiak_soc(clk,
 		  dev_tap_opcode,
 		  dev_tap_store_data,
 		  dev_tap_load_data,
+		  sim_cycle,
+		  sim_irl,
 `endif
 		  retire_op,
 		  retire_two_op,
@@ -92,7 +94,7 @@ module kodiak_soc(clk,
 		  l2_cache_accesses,
 		  l2_cache_hits,
 		  got_break,
-		  irl,
+		  ext_irq,
 		  trap_taken,
 		  trap_taken_tt,
 		  trap_taken_pc,
@@ -194,14 +196,17 @@ module kodiak_soc(clk,
 `ifdef VERILATOR
    output logic [31:0] retire_insn;
    output logic [31:0] retire_two_insn;
-   /* sim only: one pulse per access an RTL device answered (the co-sim checker
-    * replays the load data and checks it and the store against its C++ model) */
+   /* sim only: one pulse per access an RTL device takes, in the cycle it takes
+    * it (the co-sim checker replays the load data, and checks it and the store
+    * against its C++ model at that cycle's time) */
    output logic dev_tap_valid;
    output logic [`PA_WIDTH-1:0] dev_tap_addr;
    output logic [15:0] dev_tap_mask;
    output logic [4:0] dev_tap_opcode;
    output logic [127:0] dev_tap_store_data;
    output logic [127:0] dev_tap_load_data;
+   output logic [63:0] sim_cycle;          /* cycles since reset: the C++ models' clock */
+   output logic [3:0] sim_irl;             /* the core's interrupt request level */
 `endif
    output logic [8:0] retire_op;
    output logic [8:0] retire_two_op;
@@ -215,7 +220,9 @@ module kodiak_soc(clk,
    output logic [63:0] l2_cache_accesses;
    output logic [63:0] l2_cache_hits;
    output logic got_break;
-   input logic [3:0] irl;
+   /* interrupt sources of the devices still outside the SoC (the testbench's
+    * C++ models), by SLAVIO master pending bit */
+   input logic [31:0] ext_irq;
    output logic trap_taken;
    output logic [7:0] trap_taken_tt;
    output logic [31:0] trap_taken_pc;
@@ -270,6 +277,7 @@ module kodiak_soc(clk,
    logic c_rsp_valid;
    logic c_rsp_bad;
    logic [127:0] c_rsp_load_data;
+   wire [3:0] w_irl;
 
    core_l1d_l1i cpu
      (
@@ -344,7 +352,7 @@ module kodiak_soc(clk,
       .l2_cache_accesses(l2_cache_accesses),
       .l2_cache_hits(l2_cache_hits),
       .got_break(got_break),
-      .irl(irl),
+      .irl(w_irl),
       .trap_taken(trap_taken),
       .trap_taken_tt(trap_taken_tt),
       .trap_taken_pc(trap_taken_pc),
@@ -405,7 +413,17 @@ module kodiak_soc(clk,
 		     (c_req_addr[23:12] == 12'ha01) |
 		     (c_req_addr[23:12] == 12'hb00) |
 		     (c_req_addr[23:12] == 12'hf00));
-   wire w_is_dev = w_is_misc;
+   /* counter/timers: system 0xff1310000 (0x14 bytes), CPU n 0xff130n000 (0x10, n < 4) */
+   wire w_is_timer = w_is_slavio &
+		     (((c_req_addr[23:4] == 20'h31000)) |
+		      ((c_req_addr[23:4] == 20'h31001) & (c_req_mask[15:4] == 12'd0)) |
+		      ((c_req_addr[23:14] == 10'h0c0) & w_line0));
+   /* interrupt controller: master 0xff1410000 (0x14 bytes), CPU n's slave 0xff140n000 (0x10) */
+   wire w_is_intctl = w_is_slavio &
+		      (((c_req_addr[23:4] == 20'h41000)) |
+		       ((c_req_addr[23:4] == 20'h41001) & (c_req_mask[15:4] == 12'd0)) |
+		       ((c_req_addr[23:16] == 8'h40) & w_line0));
+   wire w_is_dev = w_is_misc | w_is_timer | w_is_intctl;
 
    // =====================================================================
    //  Device request FSM (Henry's): one request outstanding, as on the core
@@ -422,11 +440,15 @@ module kodiak_soc(clk,
    logic [127:0] r_dev_rdata;
    logic [127:0] n_dev_rdata;
    wire [127:0] w_rd_misc;
+   wire [127:0] w_rd_timer;
+   wire [127:0] w_rd_intctl;
+   wire w_sys_timer_irq;
+   wire w_cpu0_timer_irq;
 
    wire w_dev_accept = c_req_valid & w_is_dev & !r_dev_busy;
    wire w_dev_store = (c_req_opcode == 5'd7) | (c_req_opcode == 5'd8) | (c_req_opcode == 5'd9);
    wire w_dev_rsp = r_dev_busy & (r_dev_cnt == 2'd0);
-   wire [127:0] w_dev_rdata = w_rd_misc;
+   wire [127:0] w_dev_rdata = w_rd_misc | w_rd_timer | w_rd_intctl;
 
    slavio_misc u_misc
      (.clk(clk),
@@ -437,6 +459,34 @@ module kodiak_soc(clk,
       .mask(c_req_mask),
       .wdata(c_req_store_data),
       .rdata(w_rd_misc)
+      );
+
+   slavio_timer u_timer
+     (.clk(clk),
+      .reset(reset),
+      .sel(w_dev_accept & w_is_timer),
+      .is_store(w_dev_store),
+      .addr(c_req_addr),
+      .mask(c_req_mask),
+      .wdata(c_req_store_data),
+      .rdata(w_rd_timer),
+      .sys_irq(w_sys_timer_irq),
+      .cpu0_irq(w_cpu0_timer_irq)
+      );
+
+   /* source 19 = the system timer (level 10) */
+   slavio_intctl u_intctl
+     (.clk(clk),
+      .reset(reset),
+      .sel(w_dev_accept & w_is_intctl),
+      .is_store(w_dev_store),
+      .addr(c_req_addr),
+      .mask(c_req_mask),
+      .wdata(c_req_store_data),
+      .rdata(w_rd_intctl),
+      .src(ext_irq | {12'd0, w_sys_timer_irq, 19'd0}),
+      .cpu0_timer(w_cpu0_timer_irq),
+      .irl(w_irl)
       );
 
    always_comb
@@ -491,12 +541,26 @@ module kodiak_soc(clk,
    assign c_rsp_load_data = w_dev_rsp ? r_dev_rdata : mem_rsp_load_data;
 
 `ifdef VERILATOR
-   assign dev_tap_valid = w_dev_rsp;
+   logic [63:0] r_sim_cycle;
+   always_ff @(posedge clk)
+     begin
+	if(reset)
+	  begin
+	     r_sim_cycle <= 64'd0;
+	  end
+	else
+	  begin
+	     r_sim_cycle <= r_sim_cycle + 64'd1;
+	  end
+     end // always_ff
+   assign sim_cycle = r_sim_cycle;
+   assign sim_irl = w_irl;
+   assign dev_tap_valid = w_dev_accept;
    assign dev_tap_addr = c_req_addr;
    assign dev_tap_mask = c_req_mask;
    assign dev_tap_opcode = c_req_opcode;
    assign dev_tap_store_data = c_req_store_data;
-   assign dev_tap_load_data = r_dev_rdata;
+   assign dev_tap_load_data = w_dev_rdata;
 `endif
 
 endmodule // kodiak_soc

@@ -197,11 +197,63 @@ static bool dev_plain(uint64_t pa) {
   return pa >= SUN4M_PROM_BASE and pa < SUN4M_PROM_BASE + SUN4M_PROM_SIZE;
 }
 
+/* the C++ models' clock is the RTL's: 10 ns per cycle (100 MHz), so the C++
+ * timers count what the RTL timers count; g_clock_cycle is the RTL cycle the
+ * testbench is processing */
+static uint64_t g_clock_cycle = 0;
+static uint64_t rtl_clock_ns(void *) {
+  return g_clock_cycle * 10;
+}
+
+/* run the C++ timer events due by now (the RTL's timers tick every cycle) */
+static void board_catch_up() {
+  if(g_board->now_ns(ss) >= g_board->next_event_ns) {
+    g_board->timer_event(ss);
+  }
+}
+
+/* the device registers kodiak_soc answers (its decode, in the C++ model's
+ * terms): the SLAVIO misc registers, counter/timers and interrupt controller */
+static bool rtl_dev_pa(uint64_t pa) {
+  switch(pa)
+    {
+    case 0xff1600000ULL: case 0xff1800000ULL: case 0xff1a00000ULL:
+    case 0xff1a01000ULL: case 0xff1b00000ULL: case 0xff1f00000ULL:
+      return true;
+    default:
+      break;
+    }
+  if(pa >= 0xff1310000ULL and pa < 0xff1310014ULL) {
+    return true;
+  }
+  if(pa >= 0xff1300000ULL and pa < 0xff1304000ULL and (pa & 0xff0) == 0) {
+    return true;
+  }
+  if(pa >= 0xff1410000ULL and pa < 0xff1410014ULL) {
+    return true;
+  }
+  return pa >= 0xff1400000ULL and pa < 0xff1410000ULL and (pa & 0xff0) == 0;
+}
+
 struct dev_rec_t {
   uint64_t pa;
   uint32_t size, v;
   bool bus_error;
 };
+
+/* the RTL's device store vs the checker's: normally the checker retires the
+ * store first and the RTL's reaches the device later, but an atomic (ldstub,
+ * swap) does its device read-modify-write before it retires, so its store can
+ * come first: it waits here for the checker's */
+static std::deque<dev_rec_t> g_rtl_early_writes;
+static void dev_write_compare(const dev_rec_t &rtl, const dev_rec_t &chk) {
+  if(chk.pa != rtl.pa or chk.size != rtl.size or chk.v != rtl.v) {
+    std::cout << "DEVICE DESYNC: the RTL writes " << rtl.size << " bytes = " << std::hex << rtl.v << " at pa " << rtl.pa
+	      << ", the checker stored " << std::dec << chk.size << " bytes = " << std::hex << chk.v
+	      << " at pa " << chk.pa << std::dec << "\n";
+    g_dev_error = true;
+  }
+}
 
 /* the checker's device space: loads replay what the RTL read, stores happen
  * here (at retirement, as in ss10sim) and wait for the RTL's to compare */
@@ -231,7 +283,16 @@ public:
     return r.v;
   }
   void write(state_t *st, uint64_t pa, uint32_t size, uint32_t v, bool *bus_error) override {
-    g_board->write(st, pa, size, v, bus_error);
+    /* an RTL device's C++ model takes the store when the RTL device does
+     * (rtl_dev_write), at that cycle's time; the checker retires it earlier */
+    if(not rtl_dev_pa(pa)) {
+      g_board->write(st, pa, size, v, bus_error);
+    }
+    if(not g_rtl_early_writes.empty()) {
+      dev_write_compare(g_rtl_early_writes.front(), dev_rec_t{pa, size, v, *bus_error});
+      g_rtl_early_writes.pop_front();
+      return;
+    }
     writes.push_back(dev_rec_t{pa, size, v, *bus_error});
   }
 };
@@ -239,9 +300,7 @@ static replay_dev g_replay;
 
 /* one RTL access to device space (size 1, 2 or 4), at the board's current time */
 static uint32_t rtl_dev_read(uint64_t pa, uint32_t size, bool *bus_error) {
-  if(ss->icnt >= g_board->next_event_icnt) {
-    g_board->timer_event(ss);
-  }
+  board_catch_up();
   uint32_t v = g_board->read(ss, pa, size, bus_error);
   if(not dev_plain(pa)) {
     g_replay.reads.push_back(dev_rec_t{pa, size, v, *bus_error});
@@ -253,9 +312,7 @@ static uint32_t rtl_dev_read(uint64_t pa, uint32_t size, bool *bus_error) {
  * RTL's value, and the C++ model, read at the same point, checks it */
 static uint64_t g_dev_model_mismatch = 0;
 static void rtl_dev_check(uint64_t pa, uint32_t size, uint32_t v) {
-  if(ss->icnt >= g_board->next_event_icnt) {
-    g_board->timer_event(ss);
-  }
+  board_catch_up();
   bool be = false;
   uint32_t m = g_board->read(ss, pa, size, &be);
   g_replay.reads.push_back(dev_rec_t{pa, size, v, false});
@@ -270,18 +327,18 @@ static void rtl_dev_check(uint64_t pa, uint32_t size, uint32_t v) {
 
 static void rtl_dev_write(uint64_t pa, uint32_t size, uint32_t v) {
   if(g_replay.writes.empty()) {
-    std::cout << "DEVICE DESYNC: the RTL writes " << size << " bytes = " << std::hex << v << " at pa " << pa
-	      << " that the checker never stored" << std::dec << "\n";
-    g_dev_error = true;
-    return;
+    /* ahead of the checker (an atomic): compared when the checker stores */
+    g_rtl_early_writes.push_back(dev_rec_t{pa, size, v, false});
   }
-  dev_rec_t w = g_replay.writes.front();
-  g_replay.writes.pop_front();
-  if(w.pa != pa or w.size != size or w.v != v) {
-    std::cout << "DEVICE DESYNC: the RTL writes " << size << " bytes = " << std::hex << v << " at pa " << pa
-	      << ", the checker stored " << std::dec << w.size << " bytes = " << std::hex << w.v
-	      << " at pa " << w.pa << std::dec << "\n";
-    g_dev_error = true;
+  else {
+    dev_write_compare(dev_rec_t{pa, size, v, false}, g_replay.writes.front());
+    g_replay.writes.pop_front();
+  }
+  if(rtl_dev_pa(pa)) {
+    /* the RTL device took the store this cycle: so does its C++ model */
+    bool be = false;
+    board_catch_up();
+    g_board->write(ss, pa, size, v, &be);
   }
 }
 
@@ -946,6 +1003,7 @@ static void perform_word_store(state_t *s, uint32_t addr, uint16_t m, uint32_t d
 /* an access an RTL device in kodiak_soc answered (dev_tap_*, one per
  * request): an atomic is its load then its store, as on the memory port */
 static uint64_t g_rtl_dev_accesses = 0;
+static uint64_t g_irl_mismatch = 0;
 static void rtl_dev_tap(Vkodiak_soc *tb) {
   ++g_rtl_dev_accesses;
   const uint64_t line = tb->dev_tap_addr & ~15ULL;
@@ -1130,6 +1188,10 @@ int main(int argc, char **argv) {
     s->sun4m = nullptr;
     g_board = ss->sun4m;
     g_board->dma_hook = rtl_dma_hook;  /* device DMA writes reach the RTL's memory image after a snoop */
+    /* the C++ models count RTL cycles from the RTL's reset, which the
+     * checkpoint's power-on reset (time 0) stands for */
+    g_board->clock_ns = rtl_clock_ns;
+    g_board->time_bias_ns = 0;
     if(ss->npc != ss->pc + 4) {
       std::cerr << "checkpoint: npc " << std::hex << ss->npc << " is not pc + 4 (" << ss->pc << std::dec
 		<< "): the RTL resumes from one pc\n";
@@ -1224,30 +1286,41 @@ int main(int argc, char **argv) {
   uint32_t irq_pc = 0, irq_level = 0;
   while(!Verilated::gotFinish() && (globals::cycle < max_cycle) && (insns_retired < max_icnt)) {
     if(g_board) {
-      /* an APC halt (sun4m.cc) holds retirement; time skips to the next timer
-       * event until an interrupt is requested (ss10sim's rule) */
-      if(g_board->cpu_halted) {
-	if(ss->et and ss->irl != 0) {
-	  g_board->cpu_halted = false;
-	}
-	else if(not g_board->warp_to_next_event(ss)) {
-	  std::cout << "FAIL: the CPU halted with no timer event to wake it\n";
-	  incorrect = true;
-	  break;
-	}
+      /* an APC halt (sun4m.cc) holds retirement until an interrupt is
+       * requested.  Time runs on with the RTL's cycles (the RTL timers can't
+       * skip ahead as ss10sim's halt does). */
+      if(g_board->cpu_halted and ss->et and ss->irl != 0) {
+	g_board->cpu_halted = false;
       }
       tb->retire_allowed = g_board->cpu_halted ? 0 : 1;
-      tb->irl = ss->irl;
+      /* the interrupt sources of the devices still in C++ (sun4m_t::update_irqs) */
+      tb->ext_irq = (g_board->kbd_ms.irq ? (1u << 14) : 0) |
+	(g_board->serial.irq ? (1u << 15) : 0) |
+	(g_board->fdc.irq ? (1u << 22) : 0) |
+	(g_board->espdma.irq ? (1u << 18) : 0) |
+	(g_board->ledma.irq ? (1u << 16) : 0);
     }
     else {
-      tb->irl = 0;
+      tb->ext_irq = 0;
     }
     contextp->timeInc(1);
     snoop_drive(tb.get());
     tb->clk = 1;
     tb->eval();
-    if(g_board and tb->dev_tap_valid) {
-      rtl_dev_tap(tb.get());
+    if(g_board) {
+      /* this cycle's time: its C++ timer events, then the RTL interrupt level
+       * against the C++ model's, then a device access the RTL takes now */
+      g_clock_cycle = tb->sim_cycle;
+      board_catch_up();
+      if(tb->sim_irl != ss->irl) {
+	if(g_irl_mismatch++ < 10) {
+	  std::cout << "IRL MISMATCH: the RTL requests level " << static_cast<uint32_t>(tb->sim_irl)
+		    << ", the C++ model " << ss->irl << " at cycle " << g_clock_cycle << ", icnt " << ss->icnt << "\n";
+	}
+      }
+      if(tb->dev_tap_valid) {
+	rtl_dev_tap(tb.get());
+      }
     }
     snoop_sample(tb.get());
     if(tb->trap_taken and ((tb->trap_taken_tt & 0xf0) == 0x10) and (tb->trap_taken_tt & 0xf)) {
@@ -1350,8 +1423,8 @@ int main(int argc, char **argv) {
 	  }
 	}
       }
-      if(g_board and ss->icnt >= g_board->next_event_icnt) {
-	g_board->timer_event(ss);
+      if(g_board) {
+	board_catch_up();
       }
       if(irq_pending and rpc == irq_pc) {
 	take_interrupt(ss, irq_level);
@@ -1862,7 +1935,8 @@ int main(int argc, char **argv) {
   
   /* the checks with no failure of their own: how much they saw */
   std::cout << "tlb fills checked = " << g_tlb_fills << ", mismatched = " << g_tlb_fill_bad << "\n";
-  std::cout << "rtl device accesses = " << g_rtl_dev_accesses << ", model mismatches = " << g_dev_model_mismatch << "\n";
+  std::cout << "rtl device accesses = " << g_rtl_dev_accesses << ", model mismatches = " << g_dev_model_mismatch
+	    << ", irl mismatch cycles = " << g_irl_mismatch << "\n";
   std::cout << "dma line snoops = " << g_snoops << " (" << g_dma_lines.size() << " still queued)\n";
   std::cout << "simulation took " << t0 << " seconds, " << (insns_retired/t0)
 	    << " insns per second\n";
