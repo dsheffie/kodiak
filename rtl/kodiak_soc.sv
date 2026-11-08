@@ -2,20 +2,20 @@
 // kodiak_soc.sv -- Kodiak, the wannabe SPARCstation 20 (sun4m) SoC: top level.
 //
 // Wraps the superdupersparc core (core_l1d_l1i, the superdupersparc submodule).
-// Bring-up step A: the SoC has no RTL devices yet, so every core request (RAM,
-// the boot PROM and all device space) passes through on the external memory bus
-// unchanged; the testbench answers device space with ss10sim's C++ sun4m models.
-// The SS-20 devices move in here one at a time, re-targeted from Henry's (the
-// IP22 SoC this repo was forked from), behind a physical-address decode on the
-// core's 16-byte line bus, as henry_soc did.
+// The core's 16-byte line bus goes through a physical-address decode, as in
+// henry_soc: a request for an RTL device is answered here; everything else
+// (RAM, the boot PROM and the devices not yet in RTL) passes through on the
+// external memory bus, where the testbench answers device space with
+// ss10sim's C++ sun4m models.  The SS-20 devices move in one at a time,
+// re-targeted from Henry's (the IP22 SoC this repo was forked from).
 //
 // The ports are the core's, under the same names, so the co-sim testbench (a
-// copy of superdupersparc's top.cc) drives the SoC as it drove the bare core.
+// copy of superdupersparc's top.cc) drives the SoC as it drove the bare core,
+// plus a sim-only tap of the accesses the RTL devices answer.
 // -----------------------------------------------------------------------------
 `include "machine.vh"
 
-module kodiak_soc(
-clk,
+module kodiak_soc(clk,
 		  reset,
 		  retire_allowed,
 		  single_step,
@@ -73,6 +73,12 @@ clk,
 `ifdef VERILATOR
 		  retire_insn,
 		  retire_two_insn,
+		  dev_tap_valid,
+		  dev_tap_addr,
+		  dev_tap_mask,
+		  dev_tap_opcode,
+		  dev_tap_store_data,
+		  dev_tap_load_data,
 `endif
 		  retire_op,
 		  retire_two_op,
@@ -188,6 +194,14 @@ clk,
 `ifdef VERILATOR
    output logic [31:0] retire_insn;
    output logic [31:0] retire_two_insn;
+   /* sim only: one pulse per access an RTL device answered (the co-sim checker
+    * replays the load data and checks it and the store against its C++ model) */
+   output logic dev_tap_valid;
+   output logic [`PA_WIDTH-1:0] dev_tap_addr;
+   output logic [15:0] dev_tap_mask;
+   output logic [4:0] dev_tap_opcode;
+   output logic [127:0] dev_tap_store_data;
+   output logic [127:0] dev_tap_load_data;
 `endif
    output logic [8:0] retire_op;
    output logic [8:0] retire_two_op;
@@ -246,6 +260,17 @@ clk,
    output logic [31:0] dbg_trace_data;
    output logic [15:0] dbg_trace_wptr;
 
+   /* the core's memory bus, ahead of the device decode */
+   logic c_req_valid;
+   logic [`PA_WIDTH-1:0] c_req_addr;
+   logic [127:0] c_req_store_data;
+   logic [4:0] c_req_opcode;
+   logic [15:0] c_req_mask;
+   logic c_req_uncached;
+   logic c_rsp_valid;
+   logic c_rsp_bad;
+   logic [127:0] c_rsp_load_data;
+
    core_l1d_l1i cpu
      (
       .clk(clk),
@@ -265,15 +290,15 @@ clk,
       .resume(resume),
       .resume_pc(resume_pc),
       .ready_for_resume(ready_for_resume),
-      .mem_req_valid(mem_req_valid),
-      .mem_req_addr(mem_req_addr),
-      .mem_req_store_data(mem_req_store_data),
-      .mem_req_opcode(mem_req_opcode),
-      .mem_req_mask(mem_req_mask),
-      .mem_req_uncached(mem_req_uncached),
-      .mem_rsp_valid(mem_rsp_valid),
-      .mem_rsp_bad(mem_rsp_bad),
-      .mem_rsp_load_data(mem_rsp_load_data),
+      .mem_req_valid(c_req_valid),
+      .mem_req_addr(c_req_addr),
+      .mem_req_store_data(c_req_store_data),
+      .mem_req_opcode(c_req_opcode),
+      .mem_req_mask(c_req_mask),
+      .mem_req_uncached(c_req_uncached),
+      .mem_rsp_valid(c_rsp_valid),
+      .mem_rsp_bad(c_rsp_bad),
+      .mem_rsp_load_data(c_rsp_load_data),
       .retire_fp_reg_ptr(retire_fp_reg_ptr),
       .retire_fp_reg_data(retire_fp_reg_data),
       .retire_fp_reg_valid(retire_fp_reg_valid),
@@ -364,5 +389,114 @@ clk,
       .dbg_trace_data(dbg_trace_data),
       .dbg_trace_wptr(dbg_trace_wptr)
       );
+
+   // =====================================================================
+   //  Device decode (physical; c_req_addr is a 16-byte line).  A request for
+   //  an RTL device is answered here; everything else passes through on the
+   //  external memory bus (RAM, the boot PROM and the devices still modeled
+   //  outside the SoC).
+   // =====================================================================
+   wire w_is_slavio = (c_req_addr[`PA_WIDTH-1:24] == 12'hff1);
+   wire w_line0 = (c_req_addr[11:4] == 8'd0);
+   wire w_is_misc = w_is_slavio & w_line0 &
+		    ((c_req_addr[23:12] == 12'h600) |
+		     (c_req_addr[23:12] == 12'h800) |
+		     (c_req_addr[23:12] == 12'ha00) |
+		     (c_req_addr[23:12] == 12'ha01) |
+		     (c_req_addr[23:12] == 12'hb00) |
+		     (c_req_addr[23:12] == 12'hf00));
+   wire w_is_dev = w_is_misc;
+
+   // =====================================================================
+   //  Device request FSM (Henry's): one request outstanding, as on the core
+   //  bus.  On accept the selected device's combinational rdata is latched
+   //  and a store takes effect; the response follows DEV_LAT cycles later.
+   //  An atomic (ldstub 8 / swap 9) is both: the old value is latched and the
+   //  store data written in the same accept cycle.
+   // =====================================================================
+   localparam DEV_LAT = 2;
+   logic r_dev_busy;
+   logic n_dev_busy;
+   logic [1:0] r_dev_cnt;
+   logic [1:0] n_dev_cnt;
+   logic [127:0] r_dev_rdata;
+   logic [127:0] n_dev_rdata;
+   wire [127:0] w_rd_misc;
+
+   wire w_dev_accept = c_req_valid & w_is_dev & !r_dev_busy;
+   wire w_dev_store = (c_req_opcode == 5'd7) | (c_req_opcode == 5'd8) | (c_req_opcode == 5'd9);
+   wire w_dev_rsp = r_dev_busy & (r_dev_cnt == 2'd0);
+   wire [127:0] w_dev_rdata = w_rd_misc;
+
+   slavio_misc u_misc
+     (.clk(clk),
+      .reset(reset),
+      .sel(w_dev_accept & w_is_misc),
+      .is_store(w_dev_store),
+      .addr(c_req_addr),
+      .mask(c_req_mask),
+      .wdata(c_req_store_data),
+      .rdata(w_rd_misc)
+      );
+
+   always_comb
+     begin
+	n_dev_busy = r_dev_busy;
+	n_dev_cnt = r_dev_cnt;
+	n_dev_rdata = r_dev_rdata;
+	if(w_dev_accept)
+	  begin
+	     n_dev_busy = 1'b1;
+	     n_dev_cnt = 2'(DEV_LAT);
+	     n_dev_rdata = w_dev_rdata;
+	  end
+	else if(r_dev_busy)
+	  begin
+	     if(r_dev_cnt == 2'd0)
+	       begin
+		  n_dev_busy = 1'b0;
+	       end
+	     else
+	       begin
+		  n_dev_cnt = r_dev_cnt - 2'd1;
+	       end
+	  end
+     end // always_comb
+
+   always_ff @(posedge clk)
+     begin
+	if(reset)
+	  begin
+	     r_dev_busy <= 1'b0;
+	     r_dev_cnt <= 2'd0;
+	     r_dev_rdata <= 128'd0;
+	  end
+	else
+	  begin
+	     r_dev_busy <= n_dev_busy;
+	     r_dev_cnt <= n_dev_cnt;
+	     r_dev_rdata <= n_dev_rdata;
+	  end
+     end // always_ff
+
+   assign mem_req_valid = c_req_valid & !w_is_dev;
+   assign mem_req_addr = c_req_addr;
+   assign mem_req_store_data = c_req_store_data;
+   assign mem_req_opcode = c_req_opcode;
+   assign mem_req_mask = c_req_mask;
+   assign mem_req_uncached = c_req_uncached;
+
+   assign c_rsp_valid = w_dev_rsp | mem_rsp_valid;
+   assign c_rsp_bad = w_dev_rsp ? 1'b0 : mem_rsp_bad;
+   assign c_rsp_load_data = w_dev_rsp ? r_dev_rdata : mem_rsp_load_data;
+
+`ifdef VERILATOR
+   assign dev_tap_valid = w_dev_rsp;
+   assign dev_tap_addr = c_req_addr;
+   assign dev_tap_mask = c_req_mask;
+   assign dev_tap_opcode = c_req_opcode;
+   assign dev_tap_store_data = c_req_store_data;
+   assign dev_tap_load_data = r_dev_rdata;
+`endif
 
 endmodule // kodiak_soc

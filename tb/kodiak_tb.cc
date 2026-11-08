@@ -249,6 +249,25 @@ static uint32_t rtl_dev_read(uint64_t pa, uint32_t size, bool *bus_error) {
   return v;
 }
 
+/* one access an RTL device answered (size 1, 2 or 4): the checker replays the
+ * RTL's value, and the C++ model, read at the same point, checks it */
+static uint64_t g_dev_model_mismatch = 0;
+static void rtl_dev_check(uint64_t pa, uint32_t size, uint32_t v) {
+  if(ss->icnt >= g_board->next_event_icnt) {
+    g_board->timer_event(ss);
+  }
+  bool be = false;
+  uint32_t m = g_board->read(ss, pa, size, &be);
+  g_replay.reads.push_back(dev_rec_t{pa, size, v, false});
+  if(m != v or be) {
+    std::cout << "DEVICE MODEL MISMATCH: the RTL device read " << size << " bytes = " << std::hex << v
+	      << " at pa " << pa << ", the C++ model " << m << (be ? " (bus error)" : "")
+	      << std::dec << " at icnt " << ss->icnt << "\n";
+    ++g_dev_model_mismatch;
+    g_dev_error = true;
+  }
+}
+
 static void rtl_dev_write(uint64_t pa, uint32_t size, uint32_t v) {
   if(g_replay.writes.empty()) {
     std::cout << "DEVICE DESYNC: the RTL writes " << size << " bytes = " << std::hex << v << " at pa " << pa
@@ -270,7 +289,8 @@ static void rtl_dev_write(uint64_t pa, uint32_t size, uint32_t v) {
  * enabled bytes is one access (an 8-byte run is two words, high then low, as
  * the checker's ldd/std make them).  data[i] holds bytes line+4i.. in host
  * order of the big-endian image (perform_word_load's layout). */
-static void dev_line_access(bool store, uint64_t line, uint16_t mask, uint32_t data[4], bool *bus_error) {
+static void dev_line_access(bool store, uint64_t line, uint16_t mask, uint32_t data[4], bool *bus_error,
+			    bool from_rtl = false) {
   uint8_t bytes[16];
   for(int i = 0; i < 16; i++) {
     bytes[i] = static_cast<uint8_t>(data[i / 4] >> (8 * (i % 4)));
@@ -297,6 +317,14 @@ static void dev_line_access(bool store, uint64_t line, uint16_t mask, uint32_t d
 	  v = (v << 8) | bytes[a + b];
 	}
 	rtl_dev_write(pa, size, v);
+      }
+      else if(from_rtl) {
+	/* data[] holds what the RTL device answered */
+	uint32_t v = 0;
+	for(uint32_t b = 0; b < size; b++) {
+	  v = (v << 8) | bytes[a + b];
+	}
+	rtl_dev_check(pa, size, v);
       }
       else {
 	bool be = false;
@@ -915,6 +943,31 @@ static void perform_word_store(state_t *s, uint32_t addr, uint16_t m, uint32_t d
   }
 }
 
+/* an access an RTL device in kodiak_soc answered (dev_tap_*, one per
+ * request): an atomic is its load then its store, as on the memory port */
+static uint64_t g_rtl_dev_accesses = 0;
+static void rtl_dev_tap(Vkodiak_soc *tb) {
+  ++g_rtl_dev_accesses;
+  const uint64_t line = tb->dev_tap_addr & ~15ULL;
+  const uint16_t m = tb->dev_tap_mask;
+  const uint32_t op = tb->dev_tap_opcode;
+  const bool atomic = (op == 8) or (op == 9);
+  bool be = false;
+  uint32_t d[4];
+  if(op == 4 or atomic) {
+    for(int i = 0; i < 4; i++) {
+      d[i] = tb->dev_tap_load_data[i];
+    }
+    dev_line_access(false, line, m, d, &be, true);
+  }
+  if(op == 7 or atomic) {
+    for(int i = 0; i < 4; i++) {
+      d[i] = tb->dev_tap_store_data[i];
+    }
+    dev_line_access(true, line, m, d, &be);
+  }
+}
+
 static inline void clock_tb(Vkodiak_soc *tb) {
   tb->clk = 1;
   tb->eval();
@@ -1193,6 +1246,9 @@ int main(int argc, char **argv) {
     snoop_drive(tb.get());
     tb->clk = 1;
     tb->eval();
+    if(g_board and tb->dev_tap_valid) {
+      rtl_dev_tap(tb.get());
+    }
     snoop_sample(tb.get());
     if(tb->trap_taken and ((tb->trap_taken_tt & 0xf0) == 0x10) and (tb->trap_taken_tt & 0xf)) {
       /* an interrupt: its TRAP_L2 retires with the interrupted pc, which the
@@ -1806,6 +1862,7 @@ int main(int argc, char **argv) {
   
   /* the checks with no failure of their own: how much they saw */
   std::cout << "tlb fills checked = " << g_tlb_fills << ", mismatched = " << g_tlb_fill_bad << "\n";
+  std::cout << "rtl device accesses = " << g_rtl_dev_accesses << ", model mismatches = " << g_dev_model_mismatch << "\n";
   std::cout << "dma line snoops = " << g_snoops << " (" << g_dma_lines.size() << " still queued)\n";
   std::cout << "simulation took " << t0 << " seconds, " << (insns_retired/t0)
 	    << " insns per second\n";
