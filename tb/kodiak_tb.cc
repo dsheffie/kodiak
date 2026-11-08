@@ -212,6 +212,31 @@ static void board_catch_up() {
   }
 }
 
+/* ss10sim's system_reset (main.cc) on the checker's state: kodiak_soc's
+ * system-reset sequencer has just reset the RTL devices and holds the core in
+ * reset, seeding it from this state (have_checkpoint: g_ckpt_state == ss) */
+static void checker_system_reset(state_t *st) {
+  memset(st->r, 0, sizeof(st->r));
+  memset(st->f, 0, sizeof(st->f));
+  memset(st->asr, 0, sizeof(st->asr));
+  st->icc_n = st->icc_z = st->icc_v = st->icc_c = false;
+  st->ef = false;
+  st->s = true;
+  st->ps = true;
+  st->et = false;
+  st->pil = 0;
+  st->cwp = 0;
+  st->wim = 1;
+  st->tbr = 0;
+  st->y = 0;
+  st->fsr = 0;
+  st->fq_addr = st->fq_insn = 0;
+  st->mmu_ctrl = (st->mmu_ctrl & ~(MCR_E | MCR_NF)) | MCR_BMODE;
+  st->pc = 0;
+  st->npc = 4;
+  st->error_mode = false;
+}
+
 /* the device registers kodiak_soc answers (its decode, in the C++ model's
  * terms): the SLAVIO misc registers, counter/timers and interrupt controller */
 static bool rtl_dev_pa(uint64_t pa) {
@@ -233,6 +258,21 @@ static bool rtl_dev_pa(uint64_t pa) {
     return true;
   }
   return pa >= 0xff1400000ULL and pa < 0xff1410000ULL and (pa & 0xff0) == 0;
+}
+
+/* --console-input: ttya's output as the checker stores it (channel A data,
+ * 0xff1100006); typing starts at OBP's first "ok " prompt */
+static std::string g_ttya_tail;
+static bool g_saw_ok = false;
+static void ttya_out(uint8_t c) {
+  g_ttya_tail.push_back(static_cast<char>(c));
+  if(g_ttya_tail.size() > 8) {
+    g_ttya_tail.erase(0, g_ttya_tail.size() - 8);
+  }
+  const size_t n = g_ttya_tail.size();
+  if(n >= 4 and g_ttya_tail.compare(n - 4, 4, "\nok ") == 0) {
+    g_saw_ok = true;
+  }
 }
 
 struct dev_rec_t {
@@ -287,6 +327,9 @@ public:
      * (rtl_dev_write), at that cycle's time; the checker retires it earlier */
     if(not rtl_dev_pa(pa)) {
       g_board->write(st, pa, size, v, bus_error);
+    }
+    if(pa == 0xff1100006ULL and size == 1) {
+      ttya_out(static_cast<uint8_t>(v));
     }
     if(not g_rtl_early_writes.empty()) {
       dev_write_compare(g_rtl_early_writes.front(), dev_rec_t{pa, size, v, *bus_error});
@@ -1086,7 +1129,9 @@ int main(int argc, char **argv) {
   std::string branch_name = "branch_info.txt";
   uint64_t heartbeat = 1UL<<36, start_trace_at = ~0UL;
   uint64_t max_cycle = 0, max_icnt = 0, mem_lat = 2;
-  std::string mmu_ctrl = "0x800", mmu_ctpr = "0", mmu_ctx = "0";
+  /* MBus mode, DE, AC: an elf runs cached (superdupersparc top.cc) */
+  std::string mmu_ctrl = "0x8900", mmu_ctpr = "0", mmu_ctx = "0";
+  std::string console_input;
   std::string ckpt_file, tcx_rom;
   std::vector<std::string> scsi_disks, scsi_cdroms;
   bool cg14 = false;
@@ -1109,6 +1154,8 @@ int main(int argc, char **argv) {
        "with --checkpoint: the checkpoint has a TCX (its FCode PROM)")
       ("cg14", po::bool_switch(&cg14), "with --checkpoint: the checkpoint has a CG14")
       ("no-kbd", po::bool_switch(&no_kbd), "with --tcx/--cg14: no keyboard (as ss10sim --no-kbd; Solaris runs)")
+      ("console-input", po::value<std::string>(&console_input),
+       "with --checkpoint: a file typed into ttya once OBP first prompts ok, one byte whenever its receiver is empty (\\n is sent as \\r)")
       ("user,u", po::bool_switch(&user), "checker ISS: linux user-mode emulation (syscalls + window spill/fill)")
       ("heartbeat,h", po::value<uint64_t>(&heartbeat)->default_value(1<<24), "heartbeat for stats")
       ("log,l", po::value<std::string>(&log_name), "stats log filename")
@@ -1227,6 +1274,17 @@ int main(int argc, char **argv) {
     ss->mmu_ctx = g_mmu_preload[2];
   }
 
+  std::string con_text;
+  size_t con_pos = 0;
+  if(not console_input.empty()) {
+    std::ifstream in(console_input);
+    if(not in) {
+      std::cerr << "can't read --console-input " << console_input << "\n";
+      return -1;
+    }
+    con_text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+  }
+
   std::unique_ptr<Vkodiak_soc> tb(new Vkodiak_soc);
   uint64_t last_match_pc = 0;
   uint64_t last_retire = 0, last_check = 0;
@@ -1293,6 +1351,12 @@ int main(int argc, char **argv) {
 	g_board->cpu_halted = false;
       }
       tb->retire_allowed = g_board->cpu_halted ? 0 : 1;
+      /* --console-input: a byte into ttya (channel A) when it can take one */
+      if(g_saw_ok and (con_pos < con_text.size()) and g_board->serial.can_receive(1)) {
+	const char c = con_text[con_pos++];
+	g_board->serial.receive(1, static_cast<uint8_t>((c == '\n') ? '\r' : c));
+	g_board->update_irqs(ss);
+      }
       /* the interrupt sources of the devices still in C++ (sun4m_t::update_irqs) */
       tb->ext_irq = (g_board->kbd_ms.irq ? (1u << 14) : 0) |
 	(g_board->serial.irq ? (1u << 15) : 0) |
@@ -1320,6 +1384,26 @@ int main(int argc, char **argv) {
       }
       if(tb->dev_tap_valid) {
 	rtl_dev_tap(tb.get());
+      }
+      if(tb->sim_sys_reset) {
+	/* the RTL devices come out of reset next cycle; so do the C++ ones */
+	std::cout << "system reset at cycle " << g_clock_cycle << ", icnt " << ss->icnt << "\n";
+	g_board->reset_devices(g_board->now_ns(ss) + 10);
+	g_board->reset_req = false;
+	checker_system_reset(ss);
+	/* and the mirror of the RTL's registers the compare reads (the core takes
+	 * the same values from the seed) */
+	checker_system_reset(s);
+	g_board->update_irqs(ss);
+	/* the core's FP retire RAT and PRF come back as the reset seed */
+	for(int r = 0; r < 32; r++) {
+	  g_rtl_fp_rrat[r] = static_cast<uint32_t>(r);
+	  g_rtl_fp_prf[r] = static_cast<uint64_t>(loadfpr(r));
+	}
+	irq_pending = false;
+	/* the core's cycle count (retire statistics) restarts with it */
+	lrc = -1;
+	last_retire_cycle = 0;
       }
     }
     snoop_sample(tb.get());

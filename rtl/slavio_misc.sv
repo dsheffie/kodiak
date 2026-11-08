@@ -14,21 +14,25 @@
 // [8k+7:8k].  Each register sits big-endian at offset 0 of its line, so an
 // 8-bit register is lane 0 and sysctrl's MSB is lane 0.
 //
-// Not modeled here (still done by the testbench's C++ model on the checker's
-// store): the system reset a sysctrl write of bit 0 requests, and the
-// software power-off of aux2 bit 0.  The register values follow both.
+// A sysctrl write of bit 0 requests a system reset (sys_reset_req; the SoC's
+// sequencer performs it).  In a system reset (sys_reset) only aux1, aux2 and
+// mdm go back to 0: leds, diag and sysctrl (reset status 2) survive, as in
+// ss10sim's reset_devices.  Not modeled: the software power-off of aux2 bit 0
+// (the testbench's C++ model stops the simulation on it).
 // -----------------------------------------------------------------------------
 `include "machine.vh"
 
-module slavio_misc(clk, reset, sel, is_store, addr, mask, wdata, rdata);
+module slavio_misc(clk, reset, sys_reset, sel, is_store, addr, mask, wdata, rdata, sys_reset_req);
    input logic clk;
    input logic reset;
+   input logic sys_reset;
    input logic sel;
    input logic is_store;
    input logic [`PA_WIDTH-1:0] addr;
    input logic [15:0] mask;
    input logic [127:0] wdata;
    output logic [127:0] rdata;
+   output logic sys_reset_req;
 
    logic [15:0] r_leds;
    logic [7:0]  r_aux1;
@@ -134,6 +138,12 @@ module slavio_misc(clk, reset, sel, is_store, addr, mask, wdata, rdata);
 	     r_mdm <= 8'd0;
 	     r_sysctrl <= 32'd0;
 	  end
+	else if(sys_reset)
+	  begin
+	     r_aux1 <= 8'd0;
+	     r_aux2 <= 8'd0;
+	     r_mdm <= 8'd0;
+	  end
 	else
 	  begin
 	     r_leds <= n_leds;
@@ -144,5 +154,7 @@ module slavio_misc(clk, reset, sel, is_store, addr, mask, wdata, rdata);
 	     r_sysctrl <= n_sysctrl;
 	  end
      end // always_ff
+
+   assign sys_reset_req = w_wr & w_sysctrl & wdata[24];
 
 endmodule // slavio_misc

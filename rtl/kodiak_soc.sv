@@ -81,6 +81,7 @@ module kodiak_soc(clk,
 		  dev_tap_load_data,
 		  sim_cycle,
 		  sim_irl,
+		  sim_sys_reset,
 `endif
 		  retire_op,
 		  retire_two_op,
@@ -207,6 +208,7 @@ module kodiak_soc(clk,
    output logic [127:0] dev_tap_load_data;
    output logic [63:0] sim_cycle;          /* cycles since reset: the C++ models' clock */
    output logic [3:0] sim_irl;             /* the core's interrupt request level */
+   output logic sim_sys_reset;             /* the system reset's device-reset cycle */
 `endif
    output logic [8:0] retire_op;
    output logic [8:0] retire_two_op;
@@ -267,6 +269,29 @@ module kodiak_soc(clk,
    output logic [31:0] dbg_trace_data;
    output logic [15:0] dbg_trace_wptr;
 
+   /* the system-reset sequencer's controls (below) */
+   typedef enum logic [2:0] {
+      SR_IDLE,
+      SR_FLUSH_REQ,
+      SR_FLUSH_WAIT,
+      SR_DRAIN,
+      SR_RESET,
+      SR_RESUME_WAIT,
+      SR_RESUME
+   } sr_state_t;
+   sr_state_t r_sr_state;
+   sr_state_t n_sr_state;
+   logic [12:0] r_sr_cnt;
+   logic [12:0] n_sr_cnt;
+   wire w_sys_reset_req;
+   wire w_sr_flush = (r_sr_state == SR_FLUSH_REQ);
+   wire w_sr_hold = (r_sr_state == SR_DRAIN) | (r_sr_state == SR_RESET) |
+		    (r_sr_state == SR_RESUME_WAIT) | (r_sr_state == SR_RESUME);
+   wire w_sr_core_reset = (r_sr_state == SR_RESET);
+   /* the devices reset once, in the first cycle of the core's reset */
+   wire w_sr_dev_reset = (r_sr_state == SR_RESET) & (r_sr_cnt == 13'd0);
+   wire w_core_flush_done;
+
    /* the core's memory bus, ahead of the device decode */
    logic c_req_valid;
    logic [`PA_WIDTH-1:0] c_req_addr;
@@ -283,7 +308,8 @@ module kodiak_soc(clk,
      (
       .clk(clk),
       .reset(reset),
-      .retire_allowed(retire_allowed),
+      .sys_reset(w_sr_core_reset),
+      .retire_allowed(retire_allowed & !w_sr_hold),
       .single_step(single_step),
       .bp_enable(bp_enable),
       .fault_clear(fault_clear),
@@ -295,8 +321,8 @@ module kodiak_soc(clk,
       .l2_nocache(l2_nocache),
       .step(step),
       .in_flush_mode(in_flush_mode),
-      .resume(resume),
-      .resume_pc(resume_pc),
+      .resume(resume | (r_sr_state == SR_RESUME)),
+      .resume_pc((r_sr_state == SR_RESUME) ? `M_WIDTH'(0) : resume_pc),
       .ready_for_resume(ready_for_resume),
       .mem_req_valid(c_req_valid),
       .mem_req_addr(c_req_addr),
@@ -371,11 +397,11 @@ module kodiak_soc(clk,
       .l1i_flush_done(l1i_flush_done),
       .l1d_flush_done(l1d_flush_done),
       .l2_flush_done(l2_flush_done),
-      .ext_flush_req(ext_flush_req),
-      .ext_flush_done(ext_flush_done),
+      .ext_flush_req(ext_flush_req | w_sr_flush),
+      .ext_flush_done(w_core_flush_done),
       .ext_flush_ppn(ext_flush_ppn),
-      .ext_flush_whole(ext_flush_whole),
-      .ext_flush_drop(ext_flush_drop),
+      .ext_flush_whole(ext_flush_whole | w_sr_flush),
+      .ext_flush_drop(ext_flush_drop & !w_sr_flush),
       .ext_flush_dirty_cnt(ext_flush_dirty_cnt),
       .dbg_flush(dbg_flush),
       .dma_inval_req(dma_inval_req),
@@ -445,7 +471,7 @@ module kodiak_soc(clk,
    wire w_sys_timer_irq;
    wire w_cpu0_timer_irq;
 
-   wire w_dev_accept = c_req_valid & w_is_dev & !r_dev_busy;
+   wire w_dev_accept = c_req_valid & w_is_dev & !r_dev_busy & !w_sr_core_reset;
    wire w_dev_store = (c_req_opcode == 5'd7) | (c_req_opcode == 5'd8) | (c_req_opcode == 5'd9);
    wire w_dev_rsp = r_dev_busy & (r_dev_cnt == 2'd0);
    wire [127:0] w_dev_rdata = w_rd_misc | w_rd_timer | w_rd_intctl;
@@ -453,17 +479,19 @@ module kodiak_soc(clk,
    slavio_misc u_misc
      (.clk(clk),
       .reset(reset),
+      .sys_reset(w_sr_dev_reset),
       .sel(w_dev_accept & w_is_misc),
       .is_store(w_dev_store),
       .addr(c_req_addr),
       .mask(c_req_mask),
       .wdata(c_req_store_data),
-      .rdata(w_rd_misc)
+      .rdata(w_rd_misc),
+      .sys_reset_req(w_sys_reset_req)
       );
 
    slavio_timer u_timer
      (.clk(clk),
-      .reset(reset),
+      .reset(reset | w_sr_dev_reset),
       .sel(w_dev_accept & w_is_timer),
       .is_store(w_dev_store),
       .addr(c_req_addr),
@@ -477,7 +505,7 @@ module kodiak_soc(clk,
    /* source 19 = the system timer (level 10) */
    slavio_intctl u_intctl
      (.clk(clk),
-      .reset(reset),
+      .reset(reset | w_sr_dev_reset),
       .sel(w_dev_accept & w_is_intctl),
       .is_store(w_dev_store),
       .addr(c_req_addr),
@@ -529,7 +557,7 @@ module kodiak_soc(clk,
 	  end
      end // always_ff
 
-   assign mem_req_valid = c_req_valid & !w_is_dev;
+   assign mem_req_valid = c_req_valid & !w_is_dev & !w_sr_core_reset;
    assign mem_req_addr = c_req_addr;
    assign mem_req_store_data = c_req_store_data;
    assign mem_req_opcode = c_req_opcode;
@@ -540,7 +568,106 @@ module kodiak_soc(clk,
    assign c_rsp_bad = w_dev_rsp ? 1'b0 : mem_rsp_bad;
    assign c_rsp_load_data = w_dev_rsp ? r_dev_rdata : mem_rsp_load_data;
 
+   // =====================================================================
+   //  System reset (a sysctrl write of bit 0, slavio_misc).  ss10sim's
+   //  system_reset: the CPU and the devices back to their reset state, RAM,
+   //  the PROM, NVRAM and the surviving SLAVIO registers kept, and the CPU
+   //  restarts at pc 0.  The sequence:
+   //    FLUSH: the core writes back and invalidates its caches (its external
+   //      flush, a serializing op), so RAM has every store it retired;
+   //    DRAIN: no more retirement; wait until the core's memory bus is idle
+   //      (one request at a time: no request means none outstanding);
+   //    RESET: the core in reset (sys_reset: the MMU keeps its context, table
+   //      pointer and fault registers) for RESET_CYCLES -- the co-sim seeds the
+   //      core's register files one entry per cycle while it is held -- and the
+   //      devices for its first cycle;
+   //    RESUME: once the core is ready, resume it at pc 0.
+   //  A request while the sequence runs is ignored (OBP repeats the write
+   //  until the reset happens).
+   // =====================================================================
+   localparam RESET_CYCLES = 4096;
+   always_comb
+     begin
+	n_sr_state = r_sr_state;
+	n_sr_cnt = r_sr_cnt;
+	case(r_sr_state)
+	  SR_IDLE:
+	    begin
+	       if(w_sys_reset_req)
+		 begin
+		    n_sr_state = SR_FLUSH_REQ;
+		 end
+	    end
+	  SR_FLUSH_REQ:
+	    begin
+	       n_sr_state = SR_FLUSH_WAIT;
+	    end
+	  SR_FLUSH_WAIT:
+	    begin
+	       if(w_core_flush_done)
+		 begin
+		    n_sr_state = SR_DRAIN;
+		 end
+	    end
+	  SR_DRAIN:
+	    begin
+	       if(!c_req_valid & !r_dev_busy)
+		 begin
+		    n_sr_state = SR_RESET;
+		    n_sr_cnt = 13'd0;
+		 end
+	    end
+	  SR_RESET:
+	    begin
+	       n_sr_cnt = r_sr_cnt + 13'd1;
+	       if(r_sr_cnt == 13'(RESET_CYCLES - 1))
+		 begin
+		    n_sr_state = SR_RESUME_WAIT;
+		 end
+	    end
+	  SR_RESUME_WAIT:
+	    begin
+	       if(ready_for_resume)
+		 begin
+		    n_sr_state = SR_RESUME;
+		 end
+	    end
+	  SR_RESUME:
+	    begin
+	       n_sr_state = SR_IDLE;
+	    end
+	  default:
+	    begin
+	       n_sr_state = SR_IDLE;
+	    end
+	endcase
+     end // always_comb
+
+   always_ff @(posedge clk)
+     begin
+	if(reset)
+	  begin
+	     r_sr_state <= SR_IDLE;
+	     r_sr_cnt <= 13'd0;
+	  end
+	else
+	  begin
+	     r_sr_state <= n_sr_state;
+	     r_sr_cnt <= n_sr_cnt;
+	  end
+     end // always_ff
+
+   assign ext_flush_done = w_core_flush_done & (r_sr_state != SR_FLUSH_WAIT);
+
 `ifdef VERILATOR
+   always_ff @(posedge clk)
+     begin
+	if(!reset && (n_sr_state != r_sr_state))
+	  begin
+	     $display("[SYSRST] cycle %0d: state %0d -> %0d", r_sim_cycle, r_sr_state, n_sr_state);
+	  end
+     end // always_ff
+   assign sim_sys_reset = w_sr_dev_reset;
    logic [63:0] r_sim_cycle;
    always_ff @(posedge clk)
      begin
