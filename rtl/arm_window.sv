@@ -1,71 +1,65 @@
 `include "machine.vh"
 // -----------------------------------------------------------------------------
-// gio_window.sv -- an ARM-served GIO address window (docs/newport-on-henry.md).
+// arm_window.sv -- device space served by software on the ARM (Henry's
+// gio_window, re-targeted to Kodiak's devices that are not in RTL yet: the ZS
+// serial ports, the NVRAM, the ESP, the Lance, ...; ss10sim's sun4m C++ models
+// run on the ARM).
 //
-// The device behind the window is software on the ARM.  Every CPU access to the
-// window becomes a 16-byte record in a capture ring in the staging region:
-//   STORE: posted -- the CPU continues as soon as the record is queued.
-//   READ : the record goes through the same ring (so the ARM sees it after every
-//          earlier store), and the CPU load is held until the ARM writes the
-//          answer and then its sequence number (AXI-Lite 0x20/0x21, then 0x22).
+// Every CPU access the SoC sends here becomes a 16-byte record in a capture
+// ring in the staging region:
+//   STORE : posted -- the CPU continues as soon as the record is queued.
+//   READ  : the CPU load is held until the ARM writes the answer and then its
+//           sequence number (ans_lo, ans_hi, then ans_seq).  The record goes
+//           through the same ring, so the ARM sees it after every earlier store.
+//   ATOMIC: an ldstub or swap: held as a READ; the ARM reads the old value,
+//           answers it, then writes the record's data under its mask.
 // Record (LE, byte i = bits [8i+7:8i]):
-//   [31:0]   {type[31:30] (0 STORE, 1 READ, 2 VDMA STORE, 3 VDMA MARKER), mask[29:22], dwoff[21:0]}
-//            MARKER: mask bit 0 = BEGIN (1) / END (0) of one MC VDMA transfer
-//            dwoff[21] = `space`: 0 the window at BASE, 1 a second ARM-served device
-//            the SoC routes here (the IOC2 8042 keyboard/mouse controller)
-//   [63:32]  recno -- 1, 2, 3, ...  (numbering from 1 means the answer register's
-//            reset value 0 can never match a held load)
-//   [127:64] lane[0..7] = the bytes at window offset dwoff*8 + i
+//   [20:0]   recno[20:0] -- records are numbered 1, 2, 3, ...
+//   [53:21]  pa[35:3]: the doubleword
+//   [61:54]  byte mask: lane i = the byte at pa + i
+//   [63:62]  type: 0 STORE, 1 READ, 2 ATOMIC
+//   [127:64] lane[0..7]: the store data (zero for a READ)
+// The answer: ans_lo = lanes 0-3, ans_hi = lanes 4-7; ans_seq = {bus error,
+// retry, 9'd0, recno[20:0]}.  A bus error answers the access as a bad response
+// (the empty-slot probes in OBP depend on it); a posted store has no answer.
+// Retry is a NACK (an MBus relinquish-and-retry): the ARM needs to snoop the
+// core's caches for a DMA, which the L2 cannot do while it waits for this
+// load, so the load is answered "retry" (no data) and re-issued by the L2;
+// the ARM drops the NACKed record unperformed.
 // Ring slot of record n = (n-1) mod RING_N.  prod (records written, LE u32) is
-// published at PROD_PA after every READ record, whenever the queue drains, and at
-// least every PROD_EVERY records.  The CPU is held while the ring is full
-// (assigned - cons == RING_N).
-// One memory port (arbiter master 2, AXI lane 1); staging PAs are not snooped.  When the
-// queue holds 4 records and the next slot is 64B-aligned, they go out as one 64B burst
+// published at PROD_PA after every READ/ATOMIC record, whenever the queue
+// drains, and at least every PROD_EVERY records.  The CPU is held while the
+// ring is full (assigned - cons == RING_N).
+// One memory port, to the staging region (not snooped).  When the queue holds
+// 4 records and the next slot is 64B-aligned, they go out as one 64B burst
 // write (opcode 6); otherwise one 16B write per record.
-// A second source, the MC VDMA (memory -> GIO), adds 8-byte VDMA STORE records (mask
-// 0xff), bracketed by a BEGIN marker (queued ahead of any CPU access after the start)
-// and an END marker (after the last doubleword).  The CPU is never held for the DMA --
-// a held CPU access keeps the L1D from answering the DMA's snoops: deadlock.  Instead
-// the ARM acts as REX3 does during a host-data DMA: between the markers it reports busy
-// and applies the CPU's stores only after END (gio_service.h).
-// A record's recno is assigned when it is queued, so the ring stays in recno order.
 // -----------------------------------------------------------------------------
-module gio_window #(parameter logic [31:0] BASE       = 32'h1f0f0000,
-		    parameter int          LG_SIZE    = 13,             // 8 KB
-		    parameter logic [31:0] RING_PA    = 32'h1e200000,
+module arm_window #(parameter logic [31:0] RING_PA    = 32'h1e200000,
 		    parameter int          LG_RING_N  = 16,             // 65536 x 16 B
 		    parameter logic [31:0] PROD_PA    = 32'h1e000060,
 		    parameter int          PROD_EVERY = 32)
    (input  logic                  clk,
     input  logic                  reset,
-    // ---- CPU side (henry_soc device FSM) ----
+    // ---- CPU side (kodiak_soc's device FSM) ----
     input  logic                  sel,            // 1-cycle: accept this access
-    input  logic                  is_store,
-    input  logic                  space,          // record dwoff[21]: which ARM-served device
-    input  logic [31:0]           addr,           // 16-byte aligned (the mask selects bytes)
+    input  logic [4:0]            opcode,         // 4 load, 7 store, 8 ldstub, 9 swap
+    input  logic [`PA_WIDTH-1:0]  addr,           // 16-byte aligned (the mask selects bytes)
     input  logic [15:0]           mask,
     input  logic [127:0]          wdata,
-    output logic                  hit,            // combinational: addr is in the window
     output logic                  done,           // 1-cycle: the access is complete
+    output logic                  bad,            // with done: a bus error
+    output logic                  retry,          // with done: NACKed (re-issue the access)
     output logic [127:0]          rdata,          // valid with done (loads)
-    // ---- MC VDMA: doublewords to store into the window ----
-    input  logic                  dma_begin,      // 1-cycle: a VDMA transfer starts (queue BEGIN)
-    input  logic                  dma_end,        // 1-cycle: its last doubleword was taken (queue END)
-    input  logic                  dma_valid,
-    input  logic [31:0]           dma_addr,       // GIO address (8-byte aligned)
-    input  logic [63:0]           dma_lanes,      // lane i = the byte at dma_addr + i
-    output logic                  dma_ready,      // 1-cycle: taken this cycle
     // ---- ARM doorbells (S00_AXI) ----
     input  logic [31:0]           cons,           // records the ARM has consumed
     input  logic [31:0]           ans_lo,         // answer lanes 0-3
     input  logic [31:0]           ans_hi,         // answer lanes 4-7
-    input  logic [31:0]           ans_seq,        // recno of the READ answered
+    input  logic [31:0]           ans_seq,        // {bus error, retry, 9'd0, recno[20:0]}
     // ---- debug readback ----
     output logic [31:0]           prod,
     output logic                  pend,
     output logic [31:0]           pend_seq,
-    // ---- one memory port (arbiter master 2) ----
+    // ---- one memory port (the staging region) ----
     output logic                  mem_req_valid,
     output logic [`PA_WIDTH-1:0]  mem_req_addr,
     output logic [4:0]            mem_req_opcode,
@@ -86,50 +80,55 @@ module gio_window #(parameter logic [31:0] BASE       = 32'h1f0f0000,
    // ---- CPU side ----
    logic         r_held, n_held;          // an accepted access not yet queued
    logic [127:0] r_held_rec, n_held_rec;
-   logic         r_held_rd, n_held_rd;
-   logic         r_wait, n_wait;          // a READ is queued, waiting for its answer
+   logic         r_held_rd, n_held_rd;    // a READ or ATOMIC: waits for an answer
+   logic         r_wait, n_wait;          // a READ/ATOMIC is queued, waiting for its answer
    logic [31:0]  r_wait_seq, n_wait_seq;
    logic [31:0]  r_assigned, n_assigned;  // recno of the last record built
    logic         r_done, n_done;
+   logic         r_bad, n_bad;
+   logic         r_retry, n_retry;
    logic [127:0] r_rdata, n_rdata;
 
    // ---- writer ----
    wstate_t      r_wstate, n_wstate;
    logic [31:0]  r_written, n_written;    // records in memory
    logic [31:0]  r_published, n_published;
-   logic         r_rd_unpub, n_rd_unpub;  // a READ record is written but prod not yet published
+   logic         r_rd_unpub, n_rd_unpub;  // a READ/ATOMIC record is written but prod not yet published
 
-   logic [127:0] t_rec, t_drec, t_brec, t_erec;
-   logic         r_beg, n_beg;            // BEGIN marker to queue
-   logic         r_end, n_end;            // END marker to queue
+   logic [127:0] t_rec;
    logic [7:0]   t_lanes_mask;
    logic [63:0]  t_lanes;
+   logic         t_store, t_atomic;
    logic         t_space, t_enq, t_deq, t_deq4;
    logic [127:0] t_enq_rec;
    logic [31:0]  t_slot;
    logic [31:0]  t_ring_addr, t_prod_addr;
 
-   assign hit            = (addr[31:LG_SIZE] == BASE[31:LG_SIZE]);
    assign done           = r_done;
+   assign bad            = r_bad;
+   assign retry          = r_retry;
    assign rdata          = r_rdata;
    assign prod           = r_published;
    assign pend           = r_wait;
    assign pend_seq       = r_wait_seq;
 
+   /* a record that waits for an answer (type READ or ATOMIC) */
+   function logic rec_waits(input logic [127:0] rec);
+      rec_waits = (rec[63:62] != 2'b00);
+   endfunction
+
    always_comb
      begin
 	/* the CPU's doubleword: the core issues at most 8 bytes, in one half of the line */
+	t_store      = (opcode == 5'd7);
+	t_atomic     = (opcode == 5'd8) | (opcode == 5'd9);
 	t_lanes_mask = (|mask[15:8]) ? mask[15:8] : mask[7:0];
 	t_lanes      = (|mask[15:8]) ? wdata[127:64] : wdata[63:0];
-	t_rec        = {is_store ? t_lanes : 64'd0,      /* a READ carries no data */
-			r_assigned + 32'd1,
-			is_store ? 2'b00 : 2'b01,
+	t_rec        = {(t_store | t_atomic) ? t_lanes : 64'd0,   /* a READ carries no data */
+			t_store ? 2'b00 : (t_atomic ? 2'b10 : 2'b01),
 			t_lanes_mask,
-			space,
-			21'({addr[LG_SIZE-1:4], |mask[15:8]})};   /* addr is line aligned: the mask picks the half */
-	t_drec       = {dma_lanes, r_assigned + 32'd1, 2'b10, 8'hff, 1'b0, 21'(dma_addr[LG_SIZE-1:3])};
-	t_brec       = {64'd0, r_assigned + 32'd1, 2'b11, 8'h01, 22'd0};
-	t_erec       = {64'd0, r_assigned + 32'd1, 2'b11, 8'h00, 22'd0};
+			addr[`PA_WIDTH-1:4], |mask[15:8],   /* addr is line aligned: the mask picks the half */
+			21'(r_assigned + 32'd1)};
 	/* ring space counts every record built so far, queued or written */
 	t_space = (r_assigned - cons) < 32'(RING_N);
 
@@ -140,54 +139,20 @@ module gio_window #(parameter logic [31:0] BASE       = 32'h1f0f0000,
 	n_wait_seq  = r_wait_seq;
 	n_assigned  = r_assigned;
 	n_done      = 1'b0;
+	n_bad       = 1'b0;
+	n_retry     = 1'b0;
 	n_rdata     = r_rdata;
 	t_enq       = 1'b0;
 	t_enq_rec   = t_rec;
-	dma_ready   = 1'b0;
-	n_beg       = r_beg | dma_begin;
-	n_end       = r_end | dma_end;
 
-	if(r_beg && !r_end && (r_q_cnt != 3'(QN)) && t_space)
+	if(sel)
 	  begin
-	     /* BEGIN goes first (but after the previous transfer's END): a CPU access
-	      * this cycle waits one cycle as a held one */
-	     n_assigned = r_assigned + 32'd1;
-	     t_enq      = 1'b1;
-	     t_enq_rec  = t_brec;
-	     n_beg      = dma_begin;
-	     if(sel)
-	       begin
-		  n_held     = 1'b1;
-		  n_held_rec = t_rec;
-		  n_held_rd  = !is_store;
-	       end
-	  end
-	else if(r_end && (!dma_valid || r_beg) && (r_q_cnt != 3'(QN)) && t_space)
-	  begin
-	     /* END goes ahead of any CPU access that arrives after the transfer finished:
-	      * the CPU sees DMA_RUN clear at the same pulse, so its next GIO access (e.g.
-	      * a GFXBUSY read) must reach the ARM after END.  Safe to hold the CPU here:
-	      * the transfer's last doubleword (and its snoops) are already done. */
-	     n_assigned = r_assigned + 32'd1;
-	     t_enq      = 1'b1;
-	     t_enq_rec  = t_erec;
-	     n_end      = dma_end;
-	     if(sel)
-	       begin
-		  n_held     = 1'b1;
-		  n_held_rec = t_rec;
-		  n_held_rd  = !is_store;
-	       end
-	  end
-	else if(sel)
-	  begin
-	     /* a new access: queue it now (recno = assigned + 1), or hold it (also while
-	      * a finished transfer's END is still waiting for queue room) */
-	     if(!r_beg && !r_end && (r_q_cnt != 3'(QN)) && t_space)
+	     /* a new access: queue it now (recno = assigned + 1), or hold it */
+	     if((r_q_cnt != 3'(QN)) && t_space)
 	       begin
 		  n_assigned = r_assigned + 32'd1;
 		  t_enq = 1'b1;
-		  if(is_store)
+		  if(t_store)
 		    begin
 		       n_done = 1'b1;          /* posted */
 		    end
@@ -201,17 +166,17 @@ module gio_window #(parameter logic [31:0] BASE       = 32'h1f0f0000,
 	       begin
 		  n_held     = 1'b1;
 		  n_held_rec = t_rec;
-		  n_held_rd  = !is_store;
+		  n_held_rd  = !t_store;
 	       end
 	  end
-	else if(r_held && !r_beg && !r_end)
+	else if(r_held)
 	  begin
 	     if((r_q_cnt != 3'(QN)) && t_space)
 	       begin
 		  /* the held record takes its recno now */
 		  n_assigned = r_assigned + 32'd1;
 		  t_enq      = 1'b1;
-		  t_enq_rec  = {r_held_rec[127:64], r_assigned + 32'd1, r_held_rec[31:0]};
+		  t_enq_rec  = {r_held_rec[127:21], 21'(r_assigned + 32'd1)};
 		  n_held     = 1'b0;
 		  if(r_held_rd)
 		    begin
@@ -224,19 +189,13 @@ module gio_window #(parameter logic [31:0] BASE       = 32'h1f0f0000,
 		    end
 	       end
 	  end
-	else if(dma_valid && !r_beg && (r_q_cnt != 3'(QN)) && t_space)
-	  begin
-	     /* a VDMA doubleword: a posted store record */
-	     n_assigned = r_assigned + 32'd1;
-	     t_enq      = 1'b1;
-	     t_enq_rec  = t_drec;
-	     dma_ready  = 1'b1;
-	  end
 
-	if(r_wait && (ans_seq == r_wait_seq))
+	if(r_wait && (ans_seq[20:0] == r_wait_seq[20:0]))
 	  begin
 	     n_wait  = 1'b0;
 	     n_done  = 1'b1;
+	     n_bad   = ans_seq[31];
+	     n_retry = ans_seq[30];
 	     n_rdata = {ans_hi, ans_lo, ans_hi, ans_lo};
 	  end
      end // always_comb
@@ -284,7 +243,7 @@ module gio_window #(parameter logic [31:0] BASE       = 32'h1f0f0000,
 		 begin
 		    t_deq     = 1'b1;
 		    n_written = r_written + 32'd1;
-		    if(r_q[r_q_head][31:30] == 2'b01)
+		    if(rec_waits(r_q[r_q_head]))
 		      begin
 			 n_rd_unpub = 1'b1;
 		      end
@@ -315,8 +274,8 @@ module gio_window #(parameter logic [31:0] BASE       = 32'h1f0f0000,
 		 begin
 		    t_deq4    = 1'b1;
 		    n_written = r_written + 32'd4;
-		    if((r_q[r_q_head][31:30] == 2'b01) || (r_q[r_q_head + 2'd1][31:30] == 2'b01) ||
-		       (r_q[r_q_head + 2'd2][31:30] == 2'b01) || (r_q[r_q_head + 2'd3][31:30] == 2'b01))
+		    if(rec_waits(r_q[r_q_head]) || rec_waits(r_q[r_q_head + 2'd1]) ||
+		       rec_waits(r_q[r_q_head + 2'd2]) || rec_waits(r_q[r_q_head + 2'd3]))
 		      begin
 			 n_rd_unpub = 1'b1;
 		      end
@@ -356,13 +315,13 @@ module gio_window #(parameter logic [31:0] BASE       = 32'h1f0f0000,
 	     r_wait_seq  <= '0;
 	     r_assigned  <= '0;
 	     r_done      <= 1'b0;
+	     r_bad       <= 1'b0;
+	     r_retry     <= 1'b0;
 	     r_rdata     <= '0;
 	     r_wstate    <= W_IDLE;
 	     r_written   <= '0;
 	     r_published <= '0;
 	     r_rd_unpub  <= 1'b0;
-	     r_beg       <= 1'b0;
-	     r_end       <= 1'b0;
 	  end
 	else
 	  begin
@@ -376,14 +335,14 @@ module gio_window #(parameter logic [31:0] BASE       = 32'h1f0f0000,
 	     r_wait_seq  <= n_wait_seq;
 	     r_assigned  <= n_assigned;
 	     r_done      <= n_done;
+	     r_bad       <= n_bad;
+	     r_retry     <= n_retry;
 	     r_rdata     <= n_rdata;
 	     r_wstate    <= n_wstate;
 	     r_written   <= n_written;
 	     r_published <= n_published;
 	     r_rd_unpub  <= n_rd_unpub;
-	     r_beg       <= n_beg;
-	     r_end       <= n_end;
 	  end
      end // always_ff
 
-endmodule // gio_window
+endmodule // arm_window

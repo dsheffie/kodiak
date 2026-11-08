@@ -1,8 +1,14 @@
 #include "kodiak_tb.hh"
 #include <cstring>
 #include <deque>
+#include <array>
+#include <unordered_map>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include "sun4m.hh"
 #include "ckpt.hh"
+#include "win_service.h"
 
 /* SPARC V8 Verilator testbench.  s = the architectural state the RTL's retire
  * stream writes back (and the memory image the RTL's memory port serves); ss =
@@ -141,6 +147,11 @@ struct dma_line_t {
 static std::deque<dma_line_t> g_dma_lines;
 static bool g_snoop_req = false, g_snoop_busy = false;
 static uint64_t g_snoops = 0;
+/* the emulated ARM's own snoops (arm_snoop.sv on the board): one line at a time,
+ * the ARM blocked until it is done; they go ahead of the DMA-write snoops */
+static bool g_arm_blocked = false, g_arm_snoop_issued = false, g_arm_snoop_done = false;
+static bool g_snoop_is_arm = false;
+static uint64_t g_arm_snoop_line = 0, g_arm_snoops = 0;
 static void rtl_dma_hook(void *ctx, uint64_t pa, const uint8_t *buf, uint32_t len) {
   (void)ctx;
   for(uint32_t i = 0; i < len; ) {
@@ -160,11 +171,20 @@ static void rtl_dma_hook(void *ctx, uint64_t pa, const uint8_t *buf, uint32_t le
 }
 /* before the clock edge: offer the next line's snoop */
 template <typename T> static void snoop_drive(T *tb) {
-  if(not g_snoop_req and not g_snoop_busy and not g_dma_lines.empty()) {
+  if(not g_snoop_req and not g_snoop_busy and g_arm_blocked and not g_arm_snoop_issued) {
+    tb->snoop_req_valid = 1;
+    tb->snoop_req_addr = g_arm_snoop_line;
+    tb->snoop_req_wbinv = 1;
+    g_snoop_req = true;
+    g_snoop_is_arm = true;
+    g_arm_snoop_issued = true;
+  }
+  else if(not g_snoop_req and not g_snoop_busy and not g_dma_lines.empty()) {
     tb->snoop_req_valid = 1;
     tb->snoop_req_addr = g_dma_lines.front().line;
     tb->snoop_req_wbinv = 1;
     g_snoop_req = true;
+    g_snoop_is_arm = false;
   }
 }
 /* after the clock edge: the L2 took it / finished it (then the bytes land) */
@@ -174,7 +194,12 @@ template <typename T> static void snoop_sample(T *tb) {
     g_snoop_req = false;
     g_snoop_busy = true;
   }
-  if(g_snoop_busy and tb->snoop_done) {
+  if(g_snoop_busy and tb->snoop_done and g_snoop_is_arm) {
+    g_snoop_busy = false;
+    g_arm_snoop_done = true;
+    ++g_arm_snoops;
+  }
+  else if(g_snoop_busy and tb->snoop_done) {
     const dma_line_t &l = g_dma_lines.front();
     for(uint32_t k = 0; k < 16; k++) {
       if((l.mask >> k) & 1) {
@@ -256,6 +281,12 @@ static bool rtl_dev_pa(uint64_t pa) {
   }
   if(pa >= 0xff1410000ULL and pa < 0xff1410014ULL) {
     return true;
+  }
+  if(pa >= 0xf00000000ULL and pa < 0xf00000024ULL) {
+    return true;   /* ecc_memctl */
+  }
+  if(pa >= 0xfe0000000ULL and pa < 0xfe0004000ULL) {
+    return true;   /* sbus_iommu */
   }
   return pa >= 0xff1400000ULL and pa < 0xff1410000ULL and (pa & 0xff0) == 0;
 }
@@ -445,6 +476,162 @@ static void dev_line_access(bool store, uint64_t line, uint16_t mask, uint32_t d
 	data[i] |= static_cast<uint32_t>(bytes[4 * i + j]) << (8 * j);
       }
     }
+  }
+}
+
+/* ------------------------------------------------- the ARM-served window
+ * kodiak_soc sends every device not in RTL (and RAM past the installed size)
+ * to arm_window.sv, which writes one 16-byte record per access into a ring in
+ * the staging region (its own memory port, mem2).  On the FPGA the ARM serves
+ * the ring; here the testbench runs the same code (arm/win_service.h) on a
+ * staging image, one record --arm-lat cycles after the previous one, into the
+ * same device path the RTL's direct device accesses used (so the checker
+ * replay and compares are unchanged). */
+static const uint64_t WIN_STG_PA = RING_STG_PA;
+static std::vector<uint8_t> g_stg(RING_STG_SIZE);
+static win_svc_t g_win;
+static uint64_t g_arm_next = 0, g_arm_lat = 20;
+
+static uint32_t perform_word_load(state_t *s, uint32_t addr, uint16_t m);
+static void perform_word_store(state_t *s, uint32_t addr, uint16_t m, uint32_t d);
+
+/* one write of the window's memory port: a 16-byte line under the mask
+ * (opcode 7) or a 64-byte burst (opcode 6), into the staging image */
+template <typename T> static void staging_write(T *tb) {
+  const uint64_t pa = tb->mem2_req_addr;
+  const uint32_t n = (tb->mem2_req_opcode == 6) ? 64 : 16;
+  if(pa < WIN_STG_PA or pa + n > WIN_STG_PA + RING_STG_SIZE) {
+    std::cout << "ARM WINDOW: write outside the staging region at " << std::hex << pa << std::dec << "\n";
+    g_dev_error = true;
+    return;
+  }
+  for(uint32_t k = 0; k < n; k++) {
+    if((n == 16) and not ((tb->mem2_req_mask >> k) & 1)) {
+      continue;
+    }
+    g_stg[pa - WIN_STG_PA + k] = static_cast<uint8_t>(tb->mem2_req_store_data[k / 4] >> (8 * (k % 4)));
+  }
+}
+
+/* the doorbells drive the SoC's window inputs */
+static void tb_doorbell(void *ctx, uint32_t reg, uint32_t v) {
+  Vkodiak_soc *tb = static_cast<Vkodiak_soc*>(ctx);
+  switch(reg)
+    {
+    case WIN_DB_ANS_LO: tb->win_ans_lo = v; break;
+    case WIN_DB_ANS_HI: tb->win_ans_hi = v; break;
+    case WIN_DB_ANS_SEQ: tb->win_ans_seq = v; break;
+    case WIN_DB_CONS: tb->win_cons = v; break;
+    default: break;
+    }
+}
+
+/* the models behind the window: the C++ devices, or plain memory for a bare
+ * program (-f: no board, so memory past RAM_BYTES is memory) */
+static uint32_t tb_win_read(void *ctx, uint64_t pa, uint32_t size, bool *bus_error) {
+  (void)ctx;
+  if(g_board == nullptr) {
+    const uint32_t ea = static_cast<uint32_t>(pa & ~3ULL);
+    const uint32_t w = perform_word_load(s, ea, 0xffff);
+    const uint32_t sh = 8 * static_cast<uint32_t>(pa & 3);
+    uint32_t v = 0;
+    for(uint32_t b = 0; b < size; b++) {
+      v = (v << 8) | ((w >> (sh + 8 * b)) & 0xff);
+    }
+    return v;
+  }
+  return rtl_dev_read(pa, size, bus_error);
+}
+static void tb_win_write(void *ctx, uint64_t pa, uint32_t size, uint32_t v, bool *bus_error) {
+  (void)ctx;
+  (void)bus_error;
+  if(g_board == nullptr) {
+    for(uint32_t b = 0; b < size; b++) {
+      const uint64_t a = pa + b;
+      const uint32_t byte = (v >> (8 * (size - 1 - b))) & 0xff;
+      perform_word_store(s, static_cast<uint32_t>(a & ~3ULL), static_cast<uint16_t>(1u << (a & 15)),
+			 byte << (8 * (a & 3)));
+    }
+    return;
+  }
+  rtl_dev_write(pa, size, v);
+}
+
+/* The ARM runs as a coroutine: a thread that runs only while the clock loop
+ * waits for it (lockstep), so its dma_snoop can block as the board's does --
+ * the clock loop drives the snoop through the L2 and resumes it when it is
+ * done.  While it waits, the clock loop NACKs a held window load (the board's
+ * snoop wait loop does the same), unless --no-nack. */
+/* never destroyed: the ARM thread still waits on them when the process exits,
+ * and glibc's pthread_cond_destroy waits for its waiters */
+static std::mutex &g_co_mx = *new std::mutex;
+static std::condition_variable &g_co_cv = *new std::condition_variable;
+static bool g_co_arm_turn = false;
+static std::thread::id g_arm_tid;
+static bool g_arm_step_done = false, g_arm_step_served = false;
+static bool g_no_nack = false;
+
+static void co_yield_to_main() {
+  std::unique_lock<std::mutex> lk(g_co_mx);
+  g_co_arm_turn = false;
+  g_co_cv.notify_all();
+  g_co_cv.wait(lk, [] { return g_co_arm_turn; });
+}
+static void co_run_arm() {
+  std::unique_lock<std::mutex> lk(g_co_mx);
+  g_co_arm_turn = true;
+  g_co_cv.notify_all();
+  g_co_cv.wait(lk, [] { return not g_co_arm_turn; });
+}
+static void arm_thread_fn() {
+  {
+    std::unique_lock<std::mutex> lk(g_co_mx);
+    g_co_cv.wait(lk, [] { return g_co_arm_turn; });
+  }
+  for(;;) {
+    g_arm_step_served = win_service_one(&g_win);
+    g_arm_step_done = true;
+    co_yield_to_main();
+  }
+}
+
+/* sun4m_t::dma_snoop: on the ARM, block until each line is snooped; the
+ * checker's own model accesses (the clock-loop thread) need none */
+static void tb_dma_snoop(void *ctx, uint64_t pa, uint32_t len) {
+  (void)ctx;
+  if(std::this_thread::get_id() != g_arm_tid) {
+    return;
+  }
+  for(uint64_t line = pa & ~15ULL; line < pa + len; line += 16) {
+    g_arm_snoop_line = line;
+    g_arm_snoop_issued = false;
+    g_arm_snoop_done = false;
+    g_arm_blocked = true;
+    co_yield_to_main();
+  }
+}
+
+/* the ARM: resume it after its snoop, or run the next record when it is due */
+static void arm_service(Vkodiak_soc *tb) {
+  if(g_arm_blocked) {
+    if(not g_no_nack) {
+      win_nack_held(&g_win, (tb->win_pend ? (1u << 31) : 0) | (tb->win_pend_seq & 0x7fffffff));
+    }
+    if(not g_arm_snoop_done) {
+      return;
+    }
+    g_arm_blocked = false;
+  }
+  else if(globals::cycle < g_arm_next) {
+    return;
+  }
+  g_arm_step_done = false;
+  co_run_arm();
+  if(g_arm_step_done and g_arm_step_served) {
+    if(g_win.bad_recno != 0) {
+      g_dev_error = true;
+    }
+    g_arm_next = globals::cycle + g_arm_lat;
   }
 }
 
@@ -1140,6 +1327,7 @@ int main(int argc, char **argv) {
   std::map<uint32_t, uint64_t> pushout_histo;
   std::map<uint64_t, double> tip_map;          /* full per-cycle attribution (TIP, ported from rv64core) */
   int64_t mem_reply_cycle = -1L;
+  int64_t mem2_reply_cycle = -1L;
   try {
     po::options_description desc("Options");
     desc.add_options()
@@ -1169,6 +1357,8 @@ int main(int argc, char **argv) {
       ("pipestart", po::value<uint64_t>(&pipestart)->default_value(0), "when to start logging")
       ("pipeend", po::value<uint64_t>(&pipeend)->default_value(~0UL), "when to stop logging")
       ("topdown", po::value<bool>(&topdown::enabled)->default_value(false), "top-down slot accounting over the pipestart..pipeend window (build with +define+TOPDOWN)")
+      ("arm-lat", po::value<uint64_t>(&g_arm_lat)->default_value(20), "cycles the emulated ARM takes per window record")
+      ("no-nack", po::bool_switch(&g_no_nack), "debug: the ARM never NACKs a held window load (the DMA-snoop deadlock)")
       ("maxcycle", po::value<uint64_t>(&max_cycle)->default_value(1UL<<34), "maximum cycles")
       ("maxicnt", po::value<uint64_t>(&max_icnt)->default_value(1UL<<50), "maximum icnt")
       ("trace,t", po::value<bool>(&globals::trace_retirement)->default_value(false), "trace retired instruction stream")
@@ -1238,6 +1428,12 @@ int main(int argc, char **argv) {
     s->sun4m = nullptr;
     g_board = ss->sun4m;
     g_board->dma_hook = rtl_dma_hook;  /* device DMA writes reach the RTL's memory image after a snoop */
+    g_board->dma_snoop = tb_dma_snoop;  /* and the ARM's blocking snoops, as on the board */
+    if(s->ram_size != (256ULL << 20)) {
+      /* kodiak_soc's RAM_BYTES: accesses past it go to the window (a bus error) */
+      std::cerr << "kodiak_soc's RAM_BYTES is 256 MB, the board has " << (s->ram_size >> 20) << " MB\n";
+      return -1;
+    }
     /* the C++ models count RTL cycles from the RTL's reset, which the
      * checkpoint's power-on reset (time 0) stands for */
     g_board->clock_ns = rtl_clock_ns;
@@ -1292,6 +1488,20 @@ int main(int argc, char **argv) {
   uint32_t watch_val = (watch_pa != ~0ULL) ? ss->mem.get<uint32_t>(watch_pa) : 0;
 
   std::unique_ptr<Vkodiak_soc> tb(new Vkodiak_soc);
+  {
+    ring_io_t io;
+    io.stg = g_stg.data();
+    io.doorbell = tb_doorbell;
+    io.ctx = tb.get();
+    win_dev_t dev;
+    dev.ctx = nullptr;
+    dev.read = tb_win_read;
+    dev.write = tb_win_write;
+    win_init(&g_win, io, dev);
+    std::thread t(arm_thread_fn);
+    g_arm_tid = t.get_id();
+    t.detach();
+  }
   uint64_t last_match_pc = 0;
   uint64_t last_retire = 0, last_check = 0;
   uint64_t last_retired_pc = 0;
@@ -1718,6 +1928,17 @@ int main(int argc, char **argv) {
 
     //negedge
     tb->mem_rsp_valid = 0;
+    /* the window's ring writes, and the ARM serving them */
+    tb->mem2_rsp_valid = 0;
+    if(tb->mem2_req_valid && (mem2_reply_cycle == -1)) {
+      mem2_reply_cycle = globals::cycle + 2*mem_lat;
+    }
+    if(mem2_reply_cycle == static_cast<int64_t>(globals::cycle)) {
+      staging_write(tb.get());
+      tb->mem2_rsp_valid = 1;
+      mem2_reply_cycle = -1;
+    }
+    arm_service(tb.get());
     if(tb->mem_req_valid && (mem_reply_cycle == -1)) {
       mem_reply_cycle = globals::cycle + (tb->mem_req_opcode == 4 ? 1 : 2)*mem_lat;
     }
@@ -2036,6 +2257,9 @@ int main(int argc, char **argv) {
   std::cout << "tlb fills checked = " << g_tlb_fills << ", mismatched = " << g_tlb_fill_bad << "\n";
   std::cout << "rtl device accesses = " << g_rtl_dev_accesses << ", model mismatches = " << g_dev_model_mismatch
 	    << ", irl mismatch cycles = " << g_irl_mismatch << "\n";
+  std::cout << "arm window records = " << g_win.cons << " (" << g_win.stores << " stores, " << g_win.reads
+	    << " reads, " << g_win.atomics << " atomics, " << g_win.bus_errors << " bus errors), "
+	    << g_arm_snoops << " ARM snoops, " << g_win.nacks << " NACKs, " << g_win.skipped << " dropped\n";
   std::cout << "dma line snoops = " << g_snoops << " (" << g_dma_lines.size() << " still queued)\n";
   std::cout << "simulation took " << t0 << " seconds, " << (insns_retired/t0)
 	    << " insns per second\n";

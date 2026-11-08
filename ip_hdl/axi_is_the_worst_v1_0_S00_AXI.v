@@ -109,18 +109,13 @@ module axi_is_the_worst_v1_0_S00_AXI #
     input wire				      rv_reset,
     // ---- SCSI mailbox (host-served disk): request from henry (PS reads at 0x30-0x35);
     //      completion + tunable sel_delay written by the PS (slv_reg13/15/16/17). ----
-    input  wire [31:0]			      scsi_req_seq,
+    input  wire [31:0]			      snoop_done_seq,  // Kodiak: arm_snoop's last completed seq (read 0x30)
+    input  wire [31:0]			      iommu_ctrl,      // Kodiak: IOMMU CTRL (read 0x31)
+    input  wire [31:0]			      iommu_base,      // Kodiak: IOMMU BASE (read 0x32)
+    input  wire [31:0]			      sys_reset_cnt,   // Kodiak: system resets performed (read 0x33)
     input  wire [31:0]			      scsi_dbg,        // shim debug viz (read at 0x38)
-    input  wire [127:0]			      scsi_req_cdb,
-    input  wire [31:0]			      scsi_req_nbdp,
-    input  wire [7:0]			      scsi_req_dest,
-    input  wire [7:0]			      scsi_req_lun,
-    input  wire				      scsi_req_to_device,
-    output wire [31:0]			      scsi_rsp_seq,
-    output wire [31:0]			      scsi_rsp_residual,
-    output wire [7:0]			      scsi_rsp_scsi_status,
-    output wire [7:0]			      scsi_rsp_tgt_status,
-    output wire [15:0]			      scsi_sel_delay,
+    output wire [31:0]			      snoop_seq,       // Kodiak: write 0x0D (after the line) starts a snoop
+    output wire [31:0]			      snoop_line,      // Kodiak: write 0x0F = pa[35:4] of the line to snoop
     // ---- staging-ring doorbells (docs/arm-device-protocol.md): write-only ----
     output wire [31:0]			      ring_tx_cons,      // 0x18
     output wire [31:0]			      ring_rx_prod,      // 0x19
@@ -132,7 +127,7 @@ module axi_is_the_worst_v1_0_S00_AXI #
     output wire [31:0]			      gio_ans_hi,        // 0x21 read answer lanes 4-7
     output wire [31:0]			      gio_ans_seq,       // 0x22 answered recno (write last)
     output wire [31:0]			      gio_cons,          // 0x23 records consumed
-    output wire [15:0]			      gio_irq,           // 0x2a IRQ levels -> INT3 local1
+    output wire [31:0]			      ext_irq,           // 0x2a Kodiak: the ARM's device interrupt sources (SLAVIO intctl bits)
     input  wire [31:0]			      gio_prod,          // read 0x20
     input  wire [31:0]			      vdma_stat0,        // read 0x22: MC VDMA {non-fill starts[23:0], last mode[7:0]}
     input  wire [31:0]			      vdma_stat1,        // read 0x23: MC VDMA {fill starts[15:0], other DMA reg writes[15:0]}
@@ -446,11 +441,8 @@ module axi_is_the_worst_v1_0_S00_AXI #
    assign sgi_mode = slv_reg12[0];
    assign dbg_trace_index = slv_reg23[19:0];   // trace buffer read index {row[7:0],word[3:0]}
    // SCSI completion (PS -> henry): the ARM writes these then echoes the doorbell.
-   assign scsi_rsp_seq         = slv_reg13;        // write 0x0D (echo scsi_req_seq when done)
-   assign scsi_rsp_residual    = slv_reg15;        // write 0x0F
-   assign scsi_rsp_scsi_status = slv_reg16[7:0];   // write 0x10 = {tgt[15:8], scsi[7:0]}
-   assign scsi_rsp_tgt_status  = slv_reg16[15:8];
-   assign scsi_sel_delay       = slv_reg17[15:0];  // write 0x11 (0 => shim default 8192)
+   assign snoop_seq            = slv_reg13;        // write 0x0D (after 0x0F)
+   assign snoop_line           = slv_reg15;        // write 0x0F
 
    // ---- ext flush page list: pulse the cycle AFTER the write (register settled).
    //      0x3C = page number, 0x3D = go, bit0 = drop. ----
@@ -484,7 +476,7 @@ module axi_is_the_worst_v1_0_S00_AXI #
    assign gio_ans_seq = slv_reg34;
    assign gio_cons    = slv_reg35;
    assign gfx_perf_sel = slv_reg36[4:0];
-   assign gio_irq     = slv_reg42[15:0];
+   assign ext_irq     = slv_reg42;
 
    
    assign S_AXI_AWREADY	= axi_awready;
@@ -1427,12 +1419,12 @@ module axi_is_the_worst_v1_0_S00_AXI #
 	  6'h2F   : reg_data_out <= l1d_cache_hits[31:0];       // was l1i_cache_hits[63:32]
 	  // SCSI request mailbox (was L1D/L2 cache perf counters): PS reads the pending
 	  // command here; 0x30 is the doorbell (++ per command) the ARM polls.
-	  6'h30   : reg_data_out <= scsi_req_seq;
-	  6'h31   : reg_data_out <= scsi_req_cdb[31:0];
-	  6'h32   : reg_data_out <= scsi_req_cdb[63:32];
-	  6'h33   : reg_data_out <= scsi_req_cdb[95:64];
-	  6'h34   : reg_data_out <= scsi_req_nbdp;
-	  6'h35   : reg_data_out <= {15'd0, scsi_req_to_device, scsi_req_lun, scsi_req_dest};
+	  6'h30   : reg_data_out <= snoop_done_seq;
+	  6'h31   : reg_data_out <= iommu_ctrl;
+	  6'h32   : reg_data_out <= iommu_base;
+	  6'h33   : reg_data_out <= sys_reset_cnt;
+	  6'h34   : reg_data_out <= 32'd0;
+	  6'h35   : reg_data_out <= 32'd0;
 	  6'h36   : reg_data_out <= l2_cache_hits[31:0];
 	  6'h37   : reg_data_out <= l2_cache_accesses[31:0];    // was l2_cache_hits[63:32]
 	  // 0x38 repurposed (was branch_faults[31:0]) -> SCSI shim debug viz.

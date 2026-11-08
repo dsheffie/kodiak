@@ -29,7 +29,7 @@ VERILATOR_INC = $(VERILATOR_ROOT_DIR)/include
 VERILATOR_DPI_INC = $(VERILATOR_ROOT_DIR)/include/vltstd/
 
 OPT = -O3 -g -std=c++14
-CXXFLAGS = -std=c++11 -g $(OPT) -I. -I$(SDS) -I$(VERILATOR_INC) -I$(VERILATOR_DPI_INC)
+CXXFLAGS = -std=c++11 -g $(OPT) -I. -I$(SDS) -I$(VERILATOR_INC) -I$(VERILATOR_DPI_INC) -I../arm -I../ultra96v2_driver
 LIBS = $(EXTRA_LD) -lpthread
 
 # STORE_CHECK=1: the co-sim store check (l1d.sv wr_log vs the ISS's store stream)

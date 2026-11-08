@@ -362,11 +362,10 @@ module axi_is_the_worst_v1_0 #
 
    
    // ---- SCSI mailbox wires: henry_soc publishes req_*, S00_AXI returns rsp_*/sel_delay ----
-   wire [31:0]  w_scsi_req_seq, w_scsi_req_nbdp, w_scsi_rsp_seq, w_scsi_rsp_residual;
-   wire [127:0] w_scsi_req_cdb;
-   wire [7:0]   w_scsi_req_dest, w_scsi_req_lun, w_scsi_rsp_scsi_status, w_scsi_rsp_tgt_status;
-   wire         w_scsi_req_to_device;
-   wire [15:0]  w_scsi_sel_delay;
+   /* Kodiak: the ARM's coherent-read doorbell (arm_snoop) and the IOMMU registers it
+    * reads for the DVMA translation */
+   wire [31:0]  w_snoop_seq, w_snoop_line, w_snoop_done_seq;
+   wire [31:0]  w_iommu_ctrl, w_iommu_base, w_sys_reset_cnt;
    // staging-ring doorbells: S00_AXI (ARM) -> henry_soc engines
    wire [31:0]  w_ring_tx_cons, w_ring_rx_prod, w_ring_scsi_cq_cons, w_ring_scsi_rd_beats, w_ring_scsi_rd_seq;
    // ARM-served GIO window: S00_AXI doorbells <-> henry_soc
@@ -374,7 +373,7 @@ module axi_is_the_worst_v1_0 #
    wire [31:0]  w_vdma_stat0, w_vdma_stat1;   // MC VDMA usage counters (read 0x22/0x23)
    wire [4:0]   w_gfx_perf_sel;               // graphics-path counter select (write 0x24 [4:0])
    wire [31:0]  w_gfx_perf_data;              // selected counter half (read 0x02)
-   wire [15:0]  w_gio_irq;
+   wire [31:0]  w_ext_irq;
    wire         w_gio_pend;
    // ext flush page list: S00_AXI (ARM writes 0x3C/0x3D) -> henry_soc
    wire         w_ext_pg_push, w_ext_pg_go, w_ext_pg_drop;
@@ -471,17 +470,12 @@ module axi_is_the_worst_v1_0 #
 				       .max_fetches(w_max_fetches),
 				       .rv_reset(w_rvcontrol[0]),
 
-				       .scsi_req_seq(w_scsi_req_seq),
-				       .scsi_req_cdb(w_scsi_req_cdb),
-				       .scsi_req_nbdp(w_scsi_req_nbdp),
-				       .scsi_req_dest(w_scsi_req_dest),
-				       .scsi_req_lun(w_scsi_req_lun),
-				       .scsi_req_to_device(w_scsi_req_to_device),
-				       .scsi_rsp_seq(w_scsi_rsp_seq),
-				       .scsi_rsp_residual(w_scsi_rsp_residual),
-				       .scsi_rsp_scsi_status(w_scsi_rsp_scsi_status),
-				       .scsi_rsp_tgt_status(w_scsi_rsp_tgt_status),
-				       .scsi_sel_delay(w_scsi_sel_delay),
+				       .snoop_done_seq(w_snoop_done_seq),
+				       .iommu_ctrl(w_iommu_ctrl),
+				       .iommu_base(w_iommu_base),
+				       .sys_reset_cnt(w_sys_reset_cnt),
+				       .snoop_seq(w_snoop_seq),
+				       .snoop_line(w_snoop_line),
 				       .ring_tx_cons(w_ring_tx_cons),
 				       .ring_rx_prod(w_ring_rx_prod),
 				       .ring_scsi_cq_cons(w_ring_scsi_cq_cons),
@@ -491,7 +485,7 @@ module axi_is_the_worst_v1_0 #
 				       .gio_ans_hi(w_gio_ans_hi),
 				       .gio_ans_seq(w_gio_ans_seq),
 				       .gio_cons(w_gio_cons),
-				       .gio_irq(w_gio_irq),
+				       .ext_irq(w_ext_irq),
 				       .gio_prod(w_gio_prod),
 				       .vdma_stat0(w_vdma_stat0),
 				       .vdma_stat1(w_vdma_stat1),
@@ -566,7 +560,7 @@ module axi_is_the_worst_v1_0 #
 				       .axi_reads(w_axi_reads),
 				       .axi_writes(w_axi_writes),
 				       .max_fetches(w_max_fetches),		
-				       .sgi_mode(w_sgi_mode),
+				       .sgi_mode(1'b0),   /* Kodiak folds its own PAs (the PROM), before M00 */
 				       .mem_req_store_data(w_mem_req_store_data),
 				       
 				       .mem_req_valid(w_mem_req_valid),
@@ -637,175 +631,211 @@ module axi_is_the_worst_v1_0 #
    // Add user logic here
 
 
-   wire [63:0]					w_resume_pc64 = { {32{w_resume_pc[31]}}, w_resume_pc};
    
    
    wire [31:0] w_ext_flush_stat;     // henry_soc -> S00_AXI read 0x25 [31:1]
    wire [31:0] w_ext_flush_cycles;   // henry_soc -> S00_AXI read 0x24 [31:1]
-   // SoC-level integration: instantiate henry_soc (core + MC/HPC3/IOC2 device models,
-   // incl. the Z8530 SCC console TX + RR0) in place of the bare core.  Device-region
-   // accesses (MC 0x1fa....., IOC2 0x1fbd98.., HPC3) are handled INSIDE henry_soc and
-   // do NOT reach the external M00/DRAM bus; putchar_fifo_* is the merged SCC + core
-   // console stream.  Ports the bare core exposed but henry_soc does not (single_step/
-   // step, in_flush, *_state, branch_*, retire_op, dbg_trace_*, *_flush_done, the
-   // retire_reg_valid bits) are tied off below -> FPGA single-step + trace/state
-   // readback are inactive in the Henry build.
-   henry_soc
-     henrysoc0 (
-       .l1i_cache_accesses(w_l1i_cache_accesses),
-       .l1i_cache_hits(w_l1i_cache_hits),
-       .l1d_cache_accesses(w_l1d_cache_accesses),
-       .l1d_cache_hits(w_l1d_cache_hits),
-       .l2_cache_accesses(w_l2_cache_accesses),
-       .l2_cache_hits(w_l2_cache_hits),
-	   .clk(s00_axi_aclk),
-	   .reset(w_reset | w_rvcontrol[0]),
-	   // debug control: [31]=single_step(freeze) [30]=step-pulse [17]=bp_enable(arm fault-trap)
-	   // [18]=fault_clear(clear latch + re-arm + un-freeze).  Previously stubbed in henry_soc.
-	   .single_step(w_rvcontrol[31]),
-	   .step(w_rvcontrol[30]),
-	   .bp_enable(w_rvcontrol[17]),
-	   .fault_clear(w_rvcontrol[18]),
-	   .bp_pc(w_bp_pc),
-	   .bp_wp_addr(w_bp_wp_addr),
-	   .bp_wp_val(w_bp_wp_val),
-	   .bp_fault_only(w_rvcontrol[19]),   // [19]=freeze only on a fault at bp_pc
-	   .rt_oneshot(w_rvcontrol[22]),      // [22]=rewind+arm retire ring, one pass, self-freeze
-	   .l2_nocache(w_rvcontrol[20]),   // [20]=L2 no-cache (set before go)
-	   .trace_arm(w_rvcontrol[21]),    // [21]=arm the DRAM control-flow deep trace
-	   .trace_filter_en(w_rvcontrol[15]),        // [15]=enable the deep-trace ASID filter
-	   .trace_loadval(w_rvcontrol[14]),          // [14]=deep trace records {pc,val} load records
-	   .trace_throttle(w_rvcontrol[13]),         // [13]=stall retirement on trace FIFO high-water (lossless)
-	   .trace_pcfilt(w_rvcontrol[12]),           // [12]=record+throttle only be-text-range PCs
-	   .wf_epc(w_wf_epc), .wf_badv(w_wf_badv), .wf_stat(w_wf_stat),   // wild-fault latch (poison pointer P)
-	   .trace_target_asid(w_rvcontrol[29:22]),   // [29:22]=ASID filter target (be's ASID)
-	   .trace_ring_wptr(w_trace_ring_wptr),
-	   .trace_overflow(w_trace_overflow),
-	   .cur_asid(w_cur_asid),
-	   // SCC serial Rx driven by the ARM/PS via S00_AXI reg 0x3B (push) /
-	   // reg 0x3A bit8 (full). A pushed byte lands in the core's Rx FIFO and
-	   // raises the INT3 serial IRQ (IP2) inside henry_soc.
-	   .scc_rx_valid(w_scc_rx_push),
-	   .scc_rx_byte(w_scc_rx_data),
-	   .scc_rx_full(w_scc_rx_full),
-	   .resume(w_rvcontrol[1]),
-	   .resume_pc(w_resume_pc64),
-	   .ready_for_resume(w_ready),
+   // SoC-level integration: kodiak_soc, the SPARCstation 20 (the superdupersparc
+   // core + the SLAVIO misc/timer/interrupt-controller, ECC and IOMMU registers in
+   // RTL).  RAM and the boot PROM go out on lane 0 of the M00 master; every other
+   // device is served by software on the ARM through the window (arm_window.sv,
+   // the GIO-window doorbells 0x20-0x23 and its ring on lane 1).  The ARM's C++
+   // models raise interrupts through ext_irq (write 0x2a) and read guest RAM
+   // coherently with the snoop doorbell (arm_snoop.sv).
+   //
+   // DRAM layout (offsets from base, write 0x06, in the 496 MB the kernel reserves;
+   // mask, write 0x08, = 496 MB - 1):
+   //   0x00000000  guest RAM, pa = offset (kodiak_soc's RAM_BYTES, 256 MB)
+   //   0x1d000000  the boot PROM, 1 MB (the ARM loads OBP here), pa 0xff00xxxxx
+   //   0x1e000000  the window's staging region (prod at +0x60, the ring at +0x200000)
+   // so the lane-0 fold below maps the PROM; RAM and the staging region pass through.
+   wire [35:0] w_soc_mem_req_addr;
+   assign w_mem_req_addr = (w_soc_mem_req_addr[35:20] == 16'hff00) ?
+			   {16'h01d0, w_soc_mem_req_addr[19:0]} : w_soc_mem_req_addr;
+   wire w_snoop_req_valid, w_snoop_req_ack, w_snoop_req_wbinv, w_snoop_done;
+   wire [35:0] w_snoop_req_addr;
 
-	   .putchar_fifo_out(w_putchar_fifo_out),
-	   .putchar_fifo_empty(w_putchar_fifo_empty),
-	   .putchar_fifo_pop(w_putchar_fifo_pop),
-	   .putchar_fifo_wptr(w_putchar_fifo_wptr),
-	   .putchar_fifo_rptr(w_putchar_fifo_rptr),
+   arm_snoop armsnoop0
+     (
+      .clk(s00_axi_aclk),
+      .reset(w_reset | w_rvcontrol[0]),
+      .line(w_snoop_line),
+      .seq(w_snoop_seq),
+      .done_seq(w_snoop_done_seq),
+      .snoop_req_valid(w_snoop_req_valid),
+      .snoop_req_addr(w_snoop_req_addr),
+      .snoop_req_wbinv(w_snoop_req_wbinv),
+      .snoop_req_ack(w_snoop_req_ack),
+      .snoop_done(w_snoop_done)
+      );
 
-	   .mem_req_valid(w_mem_req_valid),
-	   .mem_req_addr(w_mem_req_addr),
-	   .mem_req_store_data(w_mem_req_store_data),
-	   .mem_req_opcode(w_mem_req_opcode),
-	   .mem_req_mask(w_mem_req_mask),
-	   .mem_rsp_valid(w_mem_rsp_valid),
-	   .mem_rsp_bad(w_mem_rsp_bad),
-	   .mem2_req_valid(w_mem2_req_valid),
-	   .mem2_req_addr(w_mem2_req_addr),
-	   .mem2_req_store_data(w_mem2_req_store_data),
-	   .mem2_req_opcode(w_mem2_req_opcode),
-	   .mem2_req_mask(w_mem2_req_mask),
-	   .mem2_rsp_valid(w_mem2_rsp_valid),
-	   .mem2_rsp_bad(w_mem2_rsp_bad),
-	   .mem2_rsp_load_data(w_mem2_load_data),
-	   .mem_rsp_load_data(w_load_data),
+   kodiak_soc
+     kodiaksoc0 (
+		 .clk(s00_axi_aclk),
+		 .reset(w_reset | w_rvcontrol[0]),
+		 .retire_allowed(1'b1),
+		 .single_step(w_rvcontrol[31]),
+		 .bp_enable(w_rvcontrol[17]),
+		 .fault_clear(w_rvcontrol[18]),
+		 .bp_pc(w_bp_pc),
+		 .bp_wp_addr(w_bp_wp_addr),
+		 .bp_wp_val(w_bp_wp_val),
+		 .bp_fault_only(w_rvcontrol[19]),
+		 .rt_oneshot(w_rvcontrol[22]),
+		 .l2_nocache(w_rvcontrol[20]),
+		 .step(w_rvcontrol[30]),
+		 .in_flush_mode(w_in_flush),
+		 .resume(w_rvcontrol[1]),
+		 .resume_pc(w_resume_pc),
+		 .ready_for_resume(w_ready),
+		 .mem_req_valid(w_mem_req_valid),
+		 .mem_req_addr(w_soc_mem_req_addr),
+		 .mem_req_store_data(w_mem_req_store_data),
+		 .mem_req_opcode(w_mem_req_opcode),
+		 .mem_req_mask(w_mem_req_mask),
+		 .mem_req_uncached(),
+		 .mem_rsp_valid(w_mem_rsp_valid),
+		 .mem_rsp_bad(w_mem_rsp_bad),
+		 .mem_rsp_load_data(w_load_data),
+		 .retire_fp_reg_ptr(),
+		 .retire_fp_reg_data(),
+		 .retire_fp_reg_valid(),
+		 .retire_fp_reg_two_ptr(),
+		 .retire_fp_reg_two_data(),
+		 .retire_fp_reg_two_valid(),
+		 .retire_fcr_reg_ptr(),
+		 .retire_fcr_reg_data(),
+		 .retire_fcr_reg_valid(),
+		 .retire_fcr_reg_two_ptr(),
+		 .retire_fcr_reg_two_data(),
+		 .retire_fcr_reg_two_valid(),
+		 .retire_load_addr(),
+		 .retire_load_addr_two(),
+		 .wf_epc(w_wf_epc),
+		 .wf_badv(w_wf_badv),
+		 .wf_stat(w_wf_stat),
+		 .retire_reg_ptr(),
+		 .retire_reg_data(),
+		 .retire_reg_valid(),
+		 .retire_reg_two_ptr(),
+		 .retire_reg_two_data(),
+		 .retire_reg_two_valid(),
+		 .retire_y_valid(),
+		 .retire_y_data(),
+		 .retire_valid(w_pc_valid),
+		 .retire_two_valid(w_pc2_valid),
+		 .retire_pc(w_pc),
+		 .retire_two_pc(w_pc2),
+		 .retire_op(),
+		 .retire_two_op(),
+		 .branch_pc(),
+		 .branch_pc_valid(),
+		 .branch_fault(),
+		 .l1i_cache_accesses(w_l1i_cache_accesses),
+		 .l1i_cache_hits(w_l1i_cache_hits),
+		 .l1d_cache_accesses(w_l1d_cache_accesses),
+		 .l1d_cache_hits(w_l1d_cache_hits),
+		 .l2_cache_accesses(w_l2_cache_accesses),
+		 .l2_cache_hits(w_l2_cache_hits),
+		 .got_break(w_got_break),
+		 .ext_irq(w_ext_irq),
+		 .trap_taken(),
+		 .trap_taken_tt(),
+		 .trap_taken_pc(),
+		 .got_ud(w_got_ud),
+		 .got_bad_addr(w_got_bad_addr),
+		 .core_state(w_state),
+		 .l1i_state(w_istate),
+		 .l1d_state(w_dstate),
+		 .l2_state(w_l2state),
+		 .l2_rsp_state(w_l2rsp_state),
+		 .inflight(w_inflight),
+		 .dbg_rob_inflight(w_dbg_rob_inflight),
+		 .epc(w_epc64[31:0]),
+		 .dbg_frozen(w_dbg_frozen),
+		 .dbg_wp_data(w_dbg_wp_data),
+		 .l1i_flush_done(w_l1i_flush_done),
+		 .l1d_flush_done(w_l1d_flush_done),
+		 .l2_flush_done(w_l2_flush_done),
+		 .ext_flush_req(1'b0),
+		 .ext_flush_done(),
+		 .ext_flush_ppn(24'd0),
+		 .ext_flush_whole(1'b0),
+		 .ext_flush_drop(1'b0),
+		 .ext_flush_dirty_cnt(),
+		 .dbg_flush(),
+		 .dma_inval_req(1'b0),
+		 .dma_inval_addr(36'd0),
+		 .dma_inval_ack(),
+		 .snoop_req_valid(w_snoop_req_valid),
+		 .snoop_req_addr(w_snoop_req_addr),
+		 .snoop_req_ack(w_snoop_req_ack),
+		 .snoop_req_wbinv(w_snoop_req_wbinv),
+		 .snoop_done(w_snoop_done),
+		 .mem2_req_valid(w_mem2_req_valid),
+		 .mem2_req_addr(w_mem2_req_addr),
+		 .mem2_req_opcode(w_mem2_req_opcode),
+		 .mem2_req_store_data(w_mem2_req_store_data),
+		 .mem2_req_mask(w_mem2_req_mask),
+		 .mem2_rsp_valid(w_mem2_rsp_valid),
+		 .win_cons(w_gio_cons),
+		 .win_ans_lo(w_gio_ans_lo),
+		 .win_ans_hi(w_gio_ans_hi),
+		 .win_ans_seq(w_gio_ans_seq),
+		 .win_prod(w_gio_prod),
+		 .win_pend(w_gio_pend),
+		 .win_pend_seq(w_gio_pend_seq),
+		 .iommu_ctrl(w_iommu_ctrl),
+		 .iommu_base(w_iommu_base),
+		 .sys_reset_cnt(w_sys_reset_cnt),
+		 .dbg_head_pc(w_dbg_head_pc[31:0]),
+		 .dbg_head_status(w_dbg_head_status),
+		 .dbg_head_fetch_cycle(),
+		 .dbg_head_alloc_cycle(),
+		 .dbg_serialize_cycle(),
+		 .dbg_cycle(),
+		 .dbg_oldest_first_pending(),
+		 .dbg_trace_index(w_trace_index),
+		 .dbg_trace_data(w_trace_data),
+		 .dbg_trace_wptr(w_trace_wptr)
+		 );
 
-	   .retire_reg_ptr(w_reg_ptr0),
-	   .retire_reg_data(w_reg_data0),
-	   .retire_reg_valid(w_reg_val0),
-	   .retire_reg_two_ptr(w_reg_ptr1),
-	   .retire_reg_two_data(w_reg_data1),
-	   .retire_reg_two_valid(w_reg_val1),
-	   .retire_valid(w_pc_valid),
-	   .retire_two_valid(w_pc2_valid),
-	   .retire_pc(w_pc),
-	   .retire_two_pc(w_pc2),
-
-	   .got_break(w_got_break),
-	   .got_ud(w_got_ud),
-	   .got_bad_addr(w_got_bad_addr),
-	   .dbg_head_pc(w_dbg_head_pc),
-	   .dbg_head_status(w_dbg_head_status),
-	   .took_irq(),
-	   .epc(w_epc),
-	   .status_reg(w_status_reg),
-	   .badvaddr(w_badvaddr),
-	   .cause(w_cause),
-	   .dbg_frozen(w_dbg_frozen),
-	   .dbg_wp_data(w_dbg_wp_data),
-	   .core_state(w_state),
-	   .l1i_state(w_istate),
-	   .l1d_state(w_dstate),
-	   .l2_state(w_l2state),
-	   .l2_rsp_state(w_l2rsp_state),
-	   .inflight(w_inflight),
-	   .dbg_rob_inflight(w_dbg_rob_inflight),
-	   .dbg_trace_index(w_trace_index),
-	   .dbg_trace_data(w_trace_data),
-	   .dbg_trace_wptr(w_trace_wptr),
-	   .scsi_req_seq(w_scsi_req_seq),
-	   .scsi_req_cdb(w_scsi_req_cdb),
-	   .scsi_req_nbdp(w_scsi_req_nbdp),
-	   .scsi_req_dest(w_scsi_req_dest),
-	   .scsi_req_lun(w_scsi_req_lun),
-	   .scsi_req_to_device(w_scsi_req_to_device),
-	   .scsi_rsp_seq(w_scsi_rsp_seq),
-	   .scsi_rsp_residual(w_scsi_rsp_residual),
-	   .scsi_rsp_scsi_status(w_scsi_rsp_scsi_status),
-	   .scsi_rsp_tgt_status(w_scsi_rsp_tgt_status),
-	   .scsi_sel_delay(w_scsi_sel_delay),
-	   .scsi_dbg(w_scsi_dbg),
-	   .ring_tx_cons(w_ring_tx_cons),
-	   .ring_rx_prod(w_ring_rx_prod),
-	   .ring_scsi_cq_cons(w_ring_scsi_cq_cons),
-	   .ring_scsi_rd_beats(w_ring_scsi_rd_beats),
-	   .ring_scsi_rd_seq(w_ring_scsi_rd_seq),
-	   .gio_cons(w_gio_cons),
-	   .gio_ans_lo(w_gio_ans_lo),
-	   .gio_ans_hi(w_gio_ans_hi),
-	   .gio_ans_seq(w_gio_ans_seq),
-	   .gio_irq(w_gio_irq),
-	   .gio_prod(w_gio_prod),
-	   .vdma_stat0(w_vdma_stat0),
-	   .vdma_stat1(w_vdma_stat1),
-	   .gfx_perf_sel(w_gfx_perf_sel),
-	   .gfx_perf_data(w_gfx_perf_data),
-	   .gio_pend(w_gio_pend),
-	   .gio_pend_seq(w_gio_pend_seq),
-	   .enet_tx_req_seq(w_enet_tx_req_seq),
-	   .enet_tx_nbdp(w_enet_tx_nbdp),
-	   .enet_rx_arm_seq(w_enet_rx_arm_seq),
-	   .enet_rx_nbdp(w_enet_rx_nbdp),
-	   .enet_station(),          // not routed to AXI v1 (IRIX filters); leave open
-	   .enet_rx_cmd(),
-	   .enet_dbg(),
-	   // [2] = ARM-requested whole-cache flush + invalidate (0->1 edge starts one)
-	   .ext_flush_ctl(w_rvcontrol[2]),
-	   .ext_pg_push(w_ext_pg_push),
-	   .ext_pg_ppn(w_ext_pg_ppn),
-	   .ext_pg_go(w_ext_pg_go),
-	   .ext_pg_drop(w_ext_pg_drop),
-	   .ext_flush_stat(w_ext_flush_stat),
-	   .ext_flush_cycles(w_ext_flush_cycles)
-	   );
-
-   // tie-offs for status/debug taps henry_soc does not expose
-   assign w_in_flush       = 1'b0;
-   // w_reg_val0/1 now driven by henrysoc0 (retire_reg_valid) -> GPR shadow updates -> readback works
+   // tie-offs for the Henry status/debug taps and devices Kodiak does not have
+   assign w_dbg_head_pc[63:32] = 32'd0;
+   assign w_epc64[63:32] = 32'd0;
+   assign w_badvaddr64 = 64'd0;
+   assign w_status_reg = 32'd0;
+   assign w_cause = 5'd0;
+   assign w_cur_asid = 8'd0;
+   assign w_trace_overflow = 1'b0;
+   assign w_trace_ring_wptr = 32'd0;
+   assign w_reg_ptr0 = 5'd0;
+   assign w_reg_ptr1 = 5'd0;
+   assign w_reg_data0 = 32'd0;
+   assign w_reg_data1 = 32'd0;
+   assign w_reg_val0 = 1'b0;
+   assign w_reg_val1 = 1'b0;
+   assign w_putchar_fifo_out = 8'd0;
+   assign w_putchar_fifo_empty = 1'b1;
+   assign w_putchar_fifo_wptr = 4'd0;
+   assign w_putchar_fifo_rptr = 4'd0;
+   assign w_ring_tx_cons = 32'd0;
+   assign w_ring_rx_prod = 32'd0;
+   assign w_vdma_stat0 = 32'd0;
+   assign w_vdma_stat1 = 32'd0;
+   assign w_gfx_perf_data = 32'd0;
+   assign w_ext_flush_stat = 32'd0;
+   assign w_ext_flush_cycles = 32'd0;
+   assign w_scsi_dbg = 32'd0;
+   assign w_enet_tx_req_seq = 32'd0;
+   assign w_enet_tx_nbdp = 32'd0;
+   assign w_enet_rx_arm_seq = 32'd0;
+   assign w_enet_rx_nbdp = 32'd0;
    assign w_op             = 7'd0;
    assign w_op2            = 7'd0;
    assign w_branch_pc      = 32'd0;
    assign w_branch_val     = 1'b0;
    assign w_branch_fault   = 1'b0;
-   // w_state/istate/dstate/l2state/l2rsp_state/inflight + trace now driven by henry_soc above
-   assign w_l1i_flush_done = 1'b0;
-   assign w_l1d_flush_done = 1'b0;
-   assign w_l2_flush_done  = 1'b0;
 
 endmodule
 

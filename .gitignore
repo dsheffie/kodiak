@@ -24,3 +24,4 @@ venv/
 log.txt
 pushout.txt
 branch_info.txt
+/hdl

@@ -3,11 +3,12 @@
 //
 // Wraps the superdupersparc core (core_l1d_l1i, the superdupersparc submodule).
 // The core's 16-byte line bus goes through a physical-address decode, as in
-// henry_soc: a request for an RTL device is answered here; everything else
-// (RAM, the boot PROM and the devices not yet in RTL) passes through on the
-// external memory bus, where the testbench answers device space with
-// ss10sim's C++ sun4m models.  The SS-20 devices move in one at a time,
-// re-targeted from Henry's (the IP22 SoC this repo was forked from).
+// henry_soc: a request for an RTL device is answered here; RAM and the boot
+// PROM pass through on the external memory bus; every other device goes to
+// the ARM-served window (arm_window.sv), where ss10sim's C++ sun4m models
+// answer it -- on the ARM on the FPGA, in the testbench in co-sim.  The SS-20
+// devices move into RTL one at a time, re-targeted from Henry's (the IP22 SoC
+// this repo was forked from).
 //
 // The ports are the core's, under the same names, so the co-sim testbench (a
 // copy of superdupersparc's top.cc) drives the SoC as it drove the bare core,
@@ -15,7 +16,8 @@
 // -----------------------------------------------------------------------------
 `include "machine.vh"
 
-module kodiak_soc(clk,
+module kodiak_soc #(parameter logic [35:0] RAM_BYTES = 36'h10000000)   /* installed RAM: 256 MB */
+  (clk,
 		  reset,
 		  retire_allowed,
 		  single_step,
@@ -129,6 +131,22 @@ module kodiak_soc(clk,
 		  snoop_req_ack,
 		  snoop_req_wbinv,
 		  snoop_done,
+		  mem2_req_valid,
+		  mem2_req_addr,
+		  mem2_req_opcode,
+		  mem2_req_store_data,
+		  mem2_req_mask,
+		  mem2_rsp_valid,
+		  win_cons,
+		  win_ans_lo,
+		  win_ans_hi,
+		  win_ans_seq,
+		  win_prod,
+		  win_pend,
+		  win_pend_seq,
+		  iommu_ctrl,
+		  iommu_base,
+		  sys_reset_cnt,
 		  dbg_head_pc,
 		  dbg_head_status,
 		  dbg_head_fetch_cycle,
@@ -258,6 +276,24 @@ module kodiak_soc(clk,
    output logic snoop_req_ack;
    input logic snoop_req_wbinv;
    output logic snoop_done;
+   /* the ARM-served window's ring writes (to the staging region) and its doorbells */
+   output logic mem2_req_valid;
+   output logic [`PA_WIDTH-1:0] mem2_req_addr;
+   output logic [4:0] mem2_req_opcode;
+   output logic [511:0] mem2_req_store_data;
+   output logic [15:0] mem2_req_mask;
+   input logic mem2_rsp_valid;
+   input logic [31:0] win_cons;
+   input logic [31:0] win_ans_lo;
+   input logic [31:0] win_ans_hi;
+   input logic [31:0] win_ans_seq;
+   output logic [31:0] win_prod;
+   output logic win_pend;
+   output logic [31:0] win_pend_seq;
+   output logic [31:0] iommu_ctrl;
+   output logic [31:0] iommu_base;
+   /* system resets performed (the ARM resets its device models when it changes) */
+   output logic [31:0] sys_reset_cnt;
    output logic [31:0] dbg_head_pc;
    output logic [31:0] dbg_head_status;
    output logic [31:0] dbg_head_fetch_cycle;
@@ -293,6 +329,7 @@ module kodiak_soc(clk,
    wire w_core_flush_done;
 
    /* the core's memory bus, ahead of the device decode */
+   logic c_rsp_retry;
    logic c_req_valid;
    logic [`PA_WIDTH-1:0] c_req_addr;
    logic [127:0] c_req_store_data;
@@ -332,6 +369,7 @@ module kodiak_soc(clk,
       .mem_req_uncached(c_req_uncached),
       .mem_rsp_valid(c_rsp_valid),
       .mem_rsp_bad(c_rsp_bad),
+      .mem_rsp_retry(c_rsp_retry),
       .mem_rsp_load_data(c_rsp_load_data),
       .retire_fp_reg_ptr(retire_fp_reg_ptr),
       .retire_fp_reg_data(retire_fp_reg_data),
@@ -449,7 +487,18 @@ module kodiak_soc(clk,
 		      (((c_req_addr[23:4] == 20'h41000)) |
 		       ((c_req_addr[23:4] == 20'h41001) & (c_req_mask[15:4] == 12'd0)) |
 		       ((c_req_addr[23:16] == 8'h40) & w_line0));
-   wire w_is_dev = w_is_misc | w_is_timer | w_is_intctl;
+   /* memory controller registers: 0xf00000000, nine words */
+   wire w_is_ecc = (c_req_addr[`PA_WIDTH-1:6] == 30'h3c000000) &
+		   ((c_req_addr[5:4] != 2'd3) & ((c_req_addr[5:4] != 2'd2) | (c_req_mask[15:4] == 12'd0)));
+   /* IOMMU registers: 0xfe0000000, 16 KB */
+   wire w_is_iommu = (c_req_addr[`PA_WIDTH-1:14] == 22'h3f8000);
+   wire w_is_dev = w_is_misc | w_is_timer | w_is_intctl | w_is_ecc | w_is_iommu;
+   /* RAM (the installed size: OBP sizes memory by probing, and an access past it is a
+    * bus error the ARM answers) and the boot PROM go to the memory bus; every other
+    * device goes to the ARM-served window */
+   wire w_is_ram = (c_req_addr < `PA_WIDTH'(RAM_BYTES));
+   wire w_is_prom = (c_req_addr[`PA_WIDTH-1:20] == 16'hff00);
+   wire w_is_win = !w_is_ram & !w_is_prom & !w_is_dev;
 
    // =====================================================================
    //  Device request FSM (Henry's): one request outstanding, as on the core
@@ -474,7 +523,35 @@ module kodiak_soc(clk,
    wire w_dev_accept = c_req_valid & w_is_dev & !r_dev_busy & !w_sr_core_reset;
    wire w_dev_store = (c_req_opcode == 5'd7) | (c_req_opcode == 5'd8) | (c_req_opcode == 5'd9);
    wire w_dev_rsp = r_dev_busy & (r_dev_cnt == 2'd0);
-   wire [127:0] w_dev_rdata = w_rd_misc | w_rd_timer | w_rd_intctl;
+   wire [127:0] w_rd_ecc;
+   wire [127:0] w_rd_iommu;
+   wire [127:0] w_dev_rdata = w_rd_misc | w_rd_timer | w_rd_intctl | w_rd_ecc | w_rd_iommu;
+
+   ecc_memctl u_ecc
+     (
+      .clk(clk),
+      .reset(reset | w_sr_dev_reset),
+      .sel(w_dev_accept & w_is_ecc),
+      .is_store(w_dev_store),
+      .addr(c_req_addr),
+      .mask(c_req_mask),
+      .wdata(c_req_store_data),
+      .rdata(w_rd_ecc)
+      );
+
+   sbus_iommu u_iommu
+     (
+      .clk(clk),
+      .reset(reset | w_sr_dev_reset),
+      .sel(w_dev_accept & w_is_iommu),
+      .is_store(w_dev_store),
+      .addr(c_req_addr),
+      .mask(c_req_mask),
+      .wdata(c_req_store_data),
+      .rdata(w_rd_iommu),
+      .ctrl(iommu_ctrl),
+      .base(iommu_base)
+      );
 
    slavio_misc u_misc
      (.clk(clk),
@@ -557,16 +634,174 @@ module kodiak_soc(clk,
 	  end
      end // always_ff
 
-   assign mem_req_valid = c_req_valid & !w_is_dev & !w_sr_core_reset;
+   // =====================================================================
+   //  The ARM-served window: one access at a time, like the device FSM.  The
+   //  window's done ends it (a posted store at once, a load or atomic when the
+   //  ARM answers); busy clears the cycle after, when the core drops the request.
+   // =====================================================================
+   logic r_win_busy;
+   logic n_win_busy;
+   wire w_win_sel = c_req_valid & w_is_win & !r_win_busy & !w_sr_core_reset;
+   wire w_win_done;
+   wire w_win_bad;
+   wire w_win_retry;
+   wire [127:0] w_win_rdata;
+
+   arm_window u_win
+     (
+      .clk(clk),
+      .reset(reset),
+      .sel(w_win_sel),
+      .opcode(c_req_opcode),
+      .addr(c_req_addr),
+      .mask(c_req_mask),
+      .wdata(c_req_store_data),
+      .done(w_win_done),
+      .bad(w_win_bad),
+      .retry(w_win_retry),
+      .rdata(w_win_rdata),
+      .cons(win_cons),
+      .ans_lo(win_ans_lo),
+      .ans_hi(win_ans_hi),
+      .ans_seq(win_ans_seq),
+      .prod(win_prod),
+      .pend(win_pend),
+      .pend_seq(win_pend_seq),
+      .mem_req_valid(mem2_req_valid),
+      .mem_req_addr(mem2_req_addr),
+      .mem_req_opcode(mem2_req_opcode),
+      .mem_req_store_data(mem2_req_store_data),
+      .mem_req_mask(mem2_req_mask),
+      .mem_rsp_valid(mem2_rsp_valid)
+      );
+
+   always_comb
+     begin
+	n_win_busy = r_win_busy;
+	if(w_win_sel)
+	  begin
+	     n_win_busy = 1'b1;
+	  end
+	else if(w_win_done)
+	  begin
+	     n_win_busy = 1'b0;
+	  end
+     end // always_comb
+
+   always_ff @(posedge clk)
+     begin
+	if(reset)
+	  begin
+	     r_win_busy <= 1'b0;
+	  end
+	else
+	  begin
+	     r_win_busy <= n_win_busy;
+	  end
+     end // always_ff
+
+   // =====================================================================
+   //  An uncached ldstub/swap to RAM (opcode 8/9: the caches off, or MMU-off
+   //  AC=0) is a read-modify-write on the memory bus, which only reads and
+   //  writes: read the line (under the atomic's mask), one idle cycle (the bus
+   //  wants the request to drop between two), write the store data under the
+   //  mask, then answer with what was read.  A bus error on the read answers at
+   //  once and skips the write.  The core holds the request until the answer.
+   // =====================================================================
+   typedef enum logic [1:0] {
+      AT_IDLE,
+      AT_RD,
+      AT_GAP,
+      AT_WR
+   } at_state_t;
+   at_state_t r_at_state;
+   at_state_t n_at_state;
+   logic [127:0] r_at_rdata;
+   logic [127:0] n_at_rdata;
+   logic t_at_done;
+   logic t_at_bad;
+   wire w_mem_sel = c_req_valid & (w_is_ram | w_is_prom) & !w_sr_core_reset;
+   wire w_mem_atomic = (c_req_opcode == 5'd8) | (c_req_opcode == 5'd9);
+
+   always_comb
+     begin
+	n_at_state = r_at_state;
+	n_at_rdata = r_at_rdata;
+	t_at_done = 1'b0;
+	t_at_bad = 1'b0;
+	case(r_at_state)
+	  AT_IDLE:
+	    begin
+	       if(w_mem_sel & w_mem_atomic)
+		 begin
+		    n_at_state = AT_RD;
+		 end
+	    end
+	  AT_RD:
+	    begin
+	       if(mem_rsp_valid)
+		 begin
+		    n_at_rdata = mem_rsp_load_data;
+		    if(mem_rsp_bad)
+		      begin
+			 t_at_done = 1'b1;
+			 t_at_bad = 1'b1;
+			 n_at_state = AT_IDLE;
+		      end
+		    else
+		      begin
+			 n_at_state = AT_GAP;
+		      end
+		 end
+	    end
+	  AT_GAP:
+	    begin
+	       n_at_state = AT_WR;
+	    end
+	  AT_WR:
+	    begin
+	       if(mem_rsp_valid)
+		 begin
+		    t_at_done = 1'b1;
+		    t_at_bad = mem_rsp_bad;
+		    n_at_state = AT_IDLE;
+		 end
+	    end
+	  default:
+	    begin
+	       n_at_state = AT_IDLE;
+	    end
+	endcase // case (r_at_state)
+     end // always_comb
+
+   always_ff @(posedge clk)
+     begin
+	if(reset)
+	  begin
+	     r_at_state <= AT_IDLE;
+	     r_at_rdata <= 128'd0;
+	  end
+	else
+	  begin
+	     r_at_state <= n_at_state;
+	     r_at_rdata <= n_at_rdata;
+	  end
+     end // always_ff
+
+   assign mem_req_valid = w_mem_sel & (!w_mem_atomic | (r_at_state == AT_RD) | (r_at_state == AT_WR));
    assign mem_req_addr = c_req_addr;
    assign mem_req_store_data = c_req_store_data;
-   assign mem_req_opcode = c_req_opcode;
+   assign mem_req_opcode = !w_mem_atomic ? c_req_opcode : ((r_at_state == AT_RD) ? 5'd4 : 5'd7);
    assign mem_req_mask = c_req_mask;
    assign mem_req_uncached = c_req_uncached;
 
-   assign c_rsp_valid = w_dev_rsp | mem_rsp_valid;
-   assign c_rsp_bad = w_dev_rsp ? 1'b0 : mem_rsp_bad;
-   assign c_rsp_load_data = w_dev_rsp ? r_dev_rdata : mem_rsp_load_data;
+   wire w_mem_rsp = mem_rsp_valid & !w_mem_atomic;
+   assign c_rsp_valid = w_dev_rsp | w_win_done | w_mem_rsp | t_at_done;
+   assign c_rsp_retry = w_win_done & w_win_retry;
+   assign c_rsp_bad = w_dev_rsp ? 1'b0 : (w_win_done ? w_win_bad : (t_at_done ? t_at_bad : mem_rsp_bad));
+   assign c_rsp_load_data = w_dev_rsp ? r_dev_rdata :
+			    (w_win_done ? w_win_rdata :
+			     (t_at_done ? ((r_at_state == AT_RD) ? mem_rsp_load_data : r_at_rdata) : mem_rsp_load_data));
 
    // =====================================================================
    //  System reset (a sysctrl write of bit 0, slavio_misc).  ss10sim's
@@ -611,7 +846,7 @@ module kodiak_soc(clk,
 	    end
 	  SR_DRAIN:
 	    begin
-	       if(!c_req_valid & !r_dev_busy)
+	       if(!c_req_valid & !r_dev_busy & !r_win_busy)
 		 begin
 		    n_sr_state = SR_RESET;
 		    n_sr_cnt = 13'd0;
@@ -658,6 +893,20 @@ module kodiak_soc(clk,
      end // always_ff
 
    assign ext_flush_done = w_core_flush_done & (r_sr_state != SR_FLUSH_WAIT);
+
+   logic [31:0] r_sys_reset_cnt;
+   always_ff @(posedge clk)
+     begin
+	if(reset)
+	  begin
+	     r_sys_reset_cnt <= 32'd0;
+	  end
+	else if(w_sr_dev_reset)
+	  begin
+	     r_sys_reset_cnt <= r_sys_reset_cnt + 32'd1;
+	  end
+     end // always_ff
+   assign sys_reset_cnt = r_sys_reset_cnt;
 
 `ifdef VERILATOR
    always_ff @(posedge clk)
