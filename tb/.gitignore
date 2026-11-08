@@ -1,0 +1,4 @@
+obj_dir/
+*.o
+*.d
+kodiak_tb
