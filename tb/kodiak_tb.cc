@@ -1132,6 +1132,7 @@ int main(int argc, char **argv) {
   /* MBus mode, DE, AC: an elf runs cached (superdupersparc top.cc) */
   std::string mmu_ctrl = "0x8900", mmu_ctpr = "0", mmu_ctx = "0";
   std::string console_input;
+  std::string watch_pa_s;
   std::string ckpt_file, tcx_rom;
   std::vector<std::string> scsi_disks, scsi_cdroms;
   bool cg14 = false;
@@ -1154,6 +1155,8 @@ int main(int argc, char **argv) {
        "with --checkpoint: the checkpoint has a TCX (its FCode PROM)")
       ("cg14", po::bool_switch(&cg14), "with --checkpoint: the checkpoint has a CG14")
       ("no-kbd", po::bool_switch(&no_kbd), "with --tcx/--cg14: no keyboard (as ss10sim --no-kbd; Solaris runs)")
+      ("watch-pa", po::value<std::string>(&watch_pa_s),
+       "debug: report each retired instruction that changes the 32-bit word at this physical address in the checker's memory")
       ("console-input", po::value<std::string>(&console_input),
        "with --checkpoint: a file typed into ttya once OBP first prompts ok, one byte whenever its receiver is empty (\\n is sent as \\r)")
       ("user,u", po::bool_switch(&user), "checker ISS: linux user-mode emulation (syscalls + window spill/fill)")
@@ -1284,6 +1287,9 @@ int main(int argc, char **argv) {
     }
     con_text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
   }
+
+  const uint64_t watch_pa = watch_pa_s.empty() ? ~0ULL : std::stoull(watch_pa_s, nullptr, 0);
+  uint32_t watch_val = (watch_pa != ~0ULL) ? ss->mem.get<uint32_t>(watch_pa) : 0;
 
   std::unique_ptr<Vkodiak_soc> tb(new Vkodiak_soc);
   uint64_t last_match_pc = 0;
@@ -1516,6 +1522,15 @@ int main(int argc, char **argv) {
       }
       else {
 	execSparc(ss);
+      }
+      if(watch_pa != ~0ULL) {
+	const uint32_t w = ss->mem.get<uint32_t>(watch_pa);
+	if(w != watch_val) {
+	  std::cout << "WATCH pa " << std::hex << watch_pa << ": " << watch_val << " -> " << w << " by pc " << rpc
+		    << " " << getAsmString(get_insn(rpc, s), rpc) << std::dec << " (retired " << insns_retired
+		    << ", cycle " << globals::cycle << ")\n";
+	  watch_val = w;
+	}
       }
       ++n_checks;
       last_check = 0;
