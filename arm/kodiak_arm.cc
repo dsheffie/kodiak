@@ -15,7 +15,14 @@
  * DMA (ESP, Lance) translates DVMA on the ARM (sun4m_t::iommu_dma) with the
  * IOMMU's CTRL and BASE from the RTL, and reads and writes guest RAM directly;
  * each line is first snooped out of the core's caches (arm_snoop.sv), and a
- * written line again after, so DRAM and the caches agree. */
+ * written line again after, so DRAM and the caches agree.
+ *
+ * NVRAM: ss20_nvram_nodiag.bin (--nvram) is the SS-20 image with a valid
+ * configuration checksum and diag-switch? false, written by OBP itself
+ * (setenv under ss10sim).  With an invalid checksum OBP falls back to
+ * diag-switch? true and runs the full 256 MB memory test -- MMU-bypass
+ * stda/ldda, uncached, one memory round trip each: ~4 of the 7 minutes to a
+ * Solaris prompt on the board. */
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -62,6 +69,40 @@ static uint32_t g_snoop_seq = 0;
 static uint64_t g_snoops = 0;
 static uint64_t g_t0_ns = 0;
 static win_svc_t g_win;
+
+#ifdef ENABLE_WIN_STATS
+/* Window traffic per device, to see where the board's time goes: every access
+ * the PL captures is a round trip through this program, and a read holds the
+ * core until it is answered.  ns = time inside the model (DMA snoops
+ * included); the rest of a round trip is the ring and the doorbells.  Printed
+ * every STAT_PERIOD_NS with the core's instruction count, and once at exit.
+ * Off by default (two clock reads per record): make WIN_STATS=1. */
+struct dev_stat_t {
+  const char *name;
+  uint64_t lo, hi;
+  uint64_t reads, writes, ns;
+  uint64_t p_reads, p_writes, p_ns;   /* at the last periodic line */
+};
+static dev_stat_t g_dev_stats[] = {
+  {"kbd/ms-zs", 0xff1000000ULL, 0xff1000008ULL, 0, 0, 0, 0, 0, 0},
+  {"serial-zs", 0xff1100000ULL, 0xff1100008ULL, 0, 0, 0, 0, 0, 0},
+  {"nvram",     0xff1200000ULL, 0xff1200000ULL + SUN4M_NVRAM_SIZE, 0, 0, 0, 0, 0, 0},
+  {"dma",       0xef0400000ULL, 0xef0400024ULL, 0, 0, 0, 0, 0, 0},
+  {"esp",       0xef0800000ULL, 0xef0800040ULL, 0, 0, 0, 0, 0, 0},
+  {"lance",     0xef0c00000ULL, 0xef0c00004ULL, 0, 0, 0, 0, 0, 0},
+  {"tcx",       tcx_t::BASE, tcx_t::BASE + tcx_t::SPAN, 0, 0, 0, 0, 0, 0},
+  {"other",     0, ~0ULL, 0, 0, 0, 0, 0, 0},
+};
+static const uint64_t STAT_PERIOD_NS = 30ULL * 1000000000ULL;
+
+static dev_stat_t *dev_stat(uint64_t pa) {
+  dev_stat_t *d = g_dev_stats;
+  while(not (pa >= d->lo and pa < d->hi)) {
+    ++d;
+  }
+  return d;
+}
+#endif
 
 static uint64_t mono_ns() {
   struct timespec ts;
@@ -110,12 +151,29 @@ struct board_ctx_t {
 };
 static uint32_t win_read(void *ctx, uint64_t pa, uint32_t size, bool *bus_error) {
   board_ctx_t *b = static_cast<board_ctx_t*>(ctx);
+#ifdef ENABLE_WIN_STATS
+  dev_stat_t *d = dev_stat(pa);
+  const uint64_t t0 = mono_ns();
+  const uint32_t v = b->board->read(b->s, pa, size, bus_error);
+  d->ns += mono_ns() - t0;
+  ++d->reads;
+  return v;
+#else
   return b->board->read(b->s, pa, size, bus_error);
+#endif
 }
 static void win_write(void *ctx, uint64_t pa, uint32_t size, uint32_t v, bool *bus_error) {
   board_ctx_t *b = static_cast<board_ctx_t*>(ctx);
+#ifdef ENABLE_WIN_STATS
+  dev_stat_t *d = dev_stat(pa);
+  const uint64_t t0 = mono_ns();
+#endif
   iommu_from_rtl(b->board);   /* a store can start a DMA */
   b->board->write(b->s, pa, size, v, bus_error);
+#ifdef ENABLE_WIN_STATS
+  d->ns += mono_ns() - t0;
+  ++d->writes;
+#endif
 }
 
 /* the IOMMU registers live in RTL: the DMA translation reads them from there,
@@ -131,6 +189,31 @@ static uint32_t ext_irq(const sun4m_t *b) {
     (b->fdc.irq ? (1u << 22) : 0) | (b->espdma.irq ? (1u << 18) : 0) |
     (b->ledma.irq ? (1u << 16) : 0);
 }
+
+#ifdef ENABLE_WIN_STATS
+/* one stats line: the core's instructions and each device's window traffic,
+ * since the last line (periodic) or since the start (final) */
+static void print_stats(const char *tag, bool periodic, uint64_t elapsed_ns, uint64_t insns) {
+  fprintf(stderr, "\nstat %s: %.1f s, %.1fM insns (%.2fM/s), %llu snoops so far", tag, elapsed_ns * 1e-9,
+	  insns * 1e-6, (elapsed_ns != 0) ? insns * 1e3 / elapsed_ns : 0.0,
+	  static_cast<unsigned long long>(g_snoops));
+  for(dev_stat_t &d : g_dev_stats) {
+    const uint64_t r = d.reads - (periodic ? d.p_reads : 0);
+    const uint64_t w = d.writes - (periodic ? d.p_writes : 0);
+    const uint64_t ns = d.ns - (periodic ? d.p_ns : 0);
+    if(r + w != 0) {
+      fprintf(stderr, " | %s r %llu w %llu %.2f s", d.name, static_cast<unsigned long long>(r),
+	      static_cast<unsigned long long>(w), ns * 1e-9);
+    }
+    if(periodic) {
+      d.p_reads = d.reads;
+      d.p_writes = d.writes;
+      d.p_ns = d.ns;
+    }
+  }
+  fprintf(stderr, "\n");
+}
+#endif
 
 /* --scsi-disk / --scsi-cdrom "[ID:]image", as ss10sim's */
 static bool attach_scsi(sun4m_t *m, const std::vector<std::string> &specs, scsi_dev_t::type_t t,
@@ -305,6 +388,11 @@ int main(int argc, char *argv[]) {
   }
   uint32_t irq = 0;
   uint64_t iter = 0;
+#ifdef ENABLE_WIN_STATS
+  /* REG_INSNS is 32 bits: accumulate deltas (a period is far under 2^32 insns) */
+  uint32_t last_insns = g_d->read32(REG_INSNS);
+  uint64_t insns = 0, period_insns = 0, period_t0 = g_t0_ns;
+#endif
   for(;;) {
     /* the window, a batch at a time */
     for(int i = 0; i < 64; i++) {
@@ -337,6 +425,17 @@ int main(int argc, char *argv[]) {
 	  board->update_irqs(s);
 	}
       }
+#ifdef ENABLE_WIN_STATS
+      const uint64_t now = mono_ns();
+      if(now - period_t0 >= STAT_PERIOD_NS) {
+	const uint32_t ni = g_d->read32(REG_INSNS);
+	insns += ni - last_insns;
+	last_insns = ni;
+	print_stats("period", true, now - period_t0, insns - period_insns);
+	period_insns = insns;
+	period_t0 = now;
+      }
+#endif
     }
     const uint32_t ni = ext_irq(board);
     if(ni != irq) {
@@ -347,6 +446,10 @@ int main(int argc, char *argv[]) {
   if(tty) {
     tcsetattr(0, TCSANOW, &old_tio);
   }
+#ifdef ENABLE_WIN_STATS
+  insns += g_d->read32(REG_INSNS) - last_insns;
+  print_stats("total", false, mono_ns() - g_t0_ns, insns);
+#endif
   printf("kodiak_arm: %llu NACKs, %llu NACKed records dropped\n", static_cast<unsigned long long>(win.nacks),
 	 static_cast<unsigned long long>(win.skipped));
   printf("kodiak_arm: %llu records (%llu stores, %llu reads, %llu atomics, %llu bus errors), %llu snoops\n",
