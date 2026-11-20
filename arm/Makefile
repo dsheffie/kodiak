@@ -10,7 +10,7 @@ LIBS = -lboost_program_options -lcapstone -pthread
 ifdef WIN_STATS
 CXXFLAGS += -DENABLE_WIN_STATS   # per-device window counters (kodiak_arm.cc)
 endif
-SDS_OBJ = sun4m.o esp.o scsi.o lance.o tcx.o cg14.o sparse_mem.o helper.o loadelf.o
+SDS_OBJ = sun4m.o esp.o scsi.o lance.o dbri.o tcx.o cg14.o sparse_mem.o helper.o loadelf.o
 OBJ = kodiak_arm.o driver.o $(SDS_OBJ)
 
 kodiak_arm: $(OBJ)

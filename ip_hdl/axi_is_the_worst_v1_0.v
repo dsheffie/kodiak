@@ -365,7 +365,7 @@ module axi_is_the_worst_v1_0 #
    /* Kodiak: the ARM's coherent-read doorbell (arm_snoop) and the IOMMU registers it
     * reads for the DVMA translation */
    wire [31:0]  w_snoop_seq, w_snoop_line, w_snoop_done_seq;
-   wire [31:0]  w_iommu_ctrl, w_iommu_base, w_sys_reset_cnt;
+   wire [31:0]  w_iommu_ctrl, w_iommu_base, w_sys_reset_cnt, w_sys_reset_ack;
    // staging-ring doorbells: S00_AXI (ARM) -> henry_soc engines
    wire [31:0]  w_ring_tx_cons, w_ring_rx_prod, w_ring_scsi_cq_cons, w_ring_scsi_rd_beats, w_ring_scsi_rd_seq;
    // ARM-served GIO window: S00_AXI doorbells <-> henry_soc
@@ -474,6 +474,7 @@ module axi_is_the_worst_v1_0 #
 				       .iommu_ctrl(w_iommu_ctrl),
 				       .iommu_base(w_iommu_base),
 				       .sys_reset_cnt(w_sys_reset_cnt),
+				       .sys_reset_ack(w_sys_reset_ack),
 				       .snoop_seq(w_snoop_seq),
 				       .snoop_line(w_snoop_line),
 				       .ring_tx_cons(w_ring_tx_cons),
@@ -788,6 +789,7 @@ module axi_is_the_worst_v1_0 #
 		 .iommu_ctrl(w_iommu_ctrl),
 		 .iommu_base(w_iommu_base),
 		 .sys_reset_cnt(w_sys_reset_cnt),
+		 .sys_reset_ack(w_sys_reset_ack),
 		 .dbg_head_pc(w_dbg_head_pc[31:0]),
 		 .dbg_head_status(w_dbg_head_status),
 		 .dbg_head_fetch_cycle(),

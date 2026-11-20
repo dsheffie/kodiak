@@ -113,6 +113,7 @@ module axi_is_the_worst_v1_0_S00_AXI #
     input  wire [31:0]			      iommu_ctrl,      // Kodiak: IOMMU CTRL (read 0x31)
     input  wire [31:0]			      iommu_base,      // Kodiak: IOMMU BASE (read 0x32)
     input  wire [31:0]			      sys_reset_cnt,   // Kodiak: system resets performed (read 0x33)
+    output wire [31:0]			      sys_reset_ack,   // Kodiak: write 0x34 = sys_reset_cnt once the ARM's devices are reset
     input  wire [31:0]			      scsi_dbg,        // shim debug viz (read at 0x38)
     output wire [31:0]			      snoop_seq,       // Kodiak: write 0x0D (after the line) starts a snoop
     output wire [31:0]			      snoop_line,      // Kodiak: write 0x0F = pa[35:4] of the line to snoop
@@ -443,6 +444,7 @@ module axi_is_the_worst_v1_0_S00_AXI #
    // SCSI completion (PS -> henry): the ARM writes these then echoes the doorbell.
    assign snoop_seq            = slv_reg13;        // write 0x0D (after 0x0F)
    assign snoop_line           = slv_reg15;        // write 0x0F
+   assign sys_reset_ack        = slv_reg52;        // write 0x34
 
    // ---- ext flush page list: pulse the cycle AFTER the write (register settled).
    //      0x3C = page number, 0x3D = go, bit0 = drop. ----
@@ -1423,7 +1425,7 @@ module axi_is_the_worst_v1_0_S00_AXI #
 	  6'h31   : reg_data_out <= iommu_ctrl;
 	  6'h32   : reg_data_out <= iommu_base;
 	  6'h33   : reg_data_out <= sys_reset_cnt;
-	  6'h34   : reg_data_out <= 32'd0;
+	  6'h34   : reg_data_out <= slv_reg52;   // sys_reset_ack
 	  6'h35   : reg_data_out <= 32'd0;
 	  6'h36   : reg_data_out <= l2_cache_hits[31:0];
 	  6'h37   : reg_data_out <= l2_cache_accesses[31:0];    // was l2_cache_hits[63:32]

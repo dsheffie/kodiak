@@ -147,6 +147,7 @@ module kodiak_soc #(parameter logic [35:0] RAM_BYTES = 36'h10000000)   /* instal
 		  iommu_ctrl,
 		  iommu_base,
 		  sys_reset_cnt,
+		  sys_reset_ack,
 		  dbg_head_pc,
 		  dbg_head_status,
 		  dbg_head_fetch_cycle,
@@ -294,6 +295,9 @@ module kodiak_soc #(parameter logic [35:0] RAM_BYTES = 36'h10000000)   /* instal
    output logic [31:0] iommu_base;
    /* system resets performed (the ARM resets its device models when it changes) */
    output logic [31:0] sys_reset_cnt;
+   /* the ARM's acknowledgement: the sys_reset_cnt it has reset its device models
+    * for (the core stays in reset until it matches) */
+   input logic [31:0] sys_reset_ack;
    output logic [31:0] dbg_head_pc;
    output logic [31:0] dbg_head_status;
    output logic [31:0] dbg_head_fetch_cycle;
@@ -816,7 +820,11 @@ module kodiak_soc #(parameter logic [35:0] RAM_BYTES = 36'h10000000)   /* instal
    //      pointer and fault registers) for RESET_CYCLES -- the co-sim seeds the
    //      core's register files one entry per cycle while it is held -- and the
    //      devices for its first cycle;
-   //    RESUME: once the core is ready, resume it at pc 0.
+   //    RESUME: once the core is ready and the ARM has reset its device models
+   //      (sys_reset_ack == sys_reset_cnt: ZS, NVRAM, ESP, Lance and the rest of
+   //      the window's devices live on the ARM), resume it at pc 0.  Without
+   //      the wait the PROM ran on devices still in the OS's state (a pending
+   //      ESP interrupt, DMA set up) until the ARM noticed the reset.
    //  A request while the sequence runs is ignored (OBP repeats the write
    //  until the reset happens).
    // =====================================================================
@@ -862,7 +870,7 @@ module kodiak_soc #(parameter logic [35:0] RAM_BYTES = 36'h10000000)   /* instal
 	    end
 	  SR_RESUME_WAIT:
 	    begin
-	       if(ready_for_resume)
+	       if(ready_for_resume & (sys_reset_ack == sys_reset_cnt))
 		 begin
 		    n_sr_state = SR_RESUME;
 		 end

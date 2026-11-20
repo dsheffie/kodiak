@@ -51,6 +51,7 @@ enum {
   REG_CONTROL0 = 0x00, REG_CONTROL = 0x04, REG_RESUME_PC = 0x05, REG_BASE = 0x06, REG_MAGIC = 0x08,
   REG_MASK = 0x08, REG_SNOOP_SEQ = 0x0d, REG_SNOOP_LINE = 0x0f,
   REG_SNOOP_DONE = 0x30, REG_IOMMU_CTRL = 0x31, REG_IOMMU_BASE = 0x32, REG_SYS_RESETS = 0x33,
+  REG_SYS_RESET_ACK = 0x34,   /* write: the system resets whose device models are reset */
   /* debug readback */
   REG_STATUS = 0x03, REG_LAST_PC = 0x07, REG_LAST_ADDR = 0x09, REG_INSNS = 0x28,
   REG_WIN_HELD = 0x21,   /* {held load pending, its recno[30:0]} */
@@ -252,6 +253,8 @@ int main(int argc, char *argv[]) {
   std::vector<std::string> scsi_disks, scsi_cdroms;
   uint64_t control = 0xa0050000ULL;   /* the BD address of the axi_is_the_worst slave */
   bool no_kbd = false;
+  uint64_t scsi_cmd_us = 250;
+  bool no_esp_timing = false;
   try {
     po::options_description desc("Options");
     desc.add_options()
@@ -263,6 +266,8 @@ int main(int argc, char *argv[]) {
       ("scsi-disk", po::value<std::vector<std::string>>(&scsi_disks), "[ID:]image: a SCSI disk")
       ("scsi-cdrom", po::value<std::vector<std::string>>(&scsi_cdroms), "[ID:]image: a SCSI CD-ROM")
       ("control", po::value<uint64_t>(&control), "physical address of the S00_AXI registers")
+      ("scsi-cmd-us", po::value<uint64_t>(&scsi_cmd_us), "a SCSI target's command overhead in us (default 250): the ESP's interrupt waits for it")
+      ("no-esp-timing", po::bool_switch(&no_esp_timing), "the ESP interrupts as soon as the model finishes a command")
       ;
     po::variables_map vm;
     po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -336,6 +341,8 @@ int main(int argc, char *argv[]) {
   s->sun4m = board;
   board->clock_ns = board_clock_ns;
   board->dma_snoop = dma_snoop;
+  board->esp_cmd_ns = scsi_cmd_us * 1000;
+  board->esp_timing = not no_esp_timing;
 
   board_ctx_t bctx = {board, s};
   win_svc_t &win = g_win;
@@ -354,7 +361,8 @@ int main(int argc, char *argv[]) {
   g_d->write32(REG_MASK, static_cast<uint32_t>(DRAM_SIZE - 1));
   g_d->write32(REG_CONTROL0, 0);
   for(uint32_t r : {(uint32_t)WIN_DB_ANS_LO, (uint32_t)WIN_DB_ANS_HI, (uint32_t)WIN_DB_ANS_SEQ,
-		    (uint32_t)WIN_DB_CONS, (uint32_t)WIN_DB_IRQ, (uint32_t)REG_SNOOP_SEQ}) {
+		    (uint32_t)WIN_DB_CONS, (uint32_t)WIN_DB_IRQ, (uint32_t)REG_SNOOP_SEQ,
+		    (uint32_t)REG_SYS_RESET_ACK}) {
     g_d->write32(r, 0);
   }
   /* hold reset well past the core's per-cycle register-file seeding (kodiak_tb
@@ -409,12 +417,14 @@ int main(int argc, char *argv[]) {
       board->timer_event(s);
     }
     if((++iter & 255) == 0) {
-      /* a system reset by the RTL's sequencer: the devices here reset too */
+      /* a system reset by the RTL's sequencer: the devices here reset too, and
+       * the core stays in reset until we say so (kodiak_soc.sv RESUME_WAIT) */
       const uint32_t n = g_d->read32(REG_SYS_RESETS);
       if(n != sys_resets) {
 	sys_resets = n;
 	board->reset_devices(board->now_ns(s));
 	board->reset_req = false;
+	g_d->write32(REG_SYS_RESET_ACK, n);
 	printf("\nkodiak_arm: system reset\n");
       }
       struct pollfd pfd = {0, POLLIN, 0};

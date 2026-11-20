@@ -97,6 +97,36 @@ extern "C" {
  * PIL 11:8, S 7, PS 6, ET 5, CWP 4:0) and WIM after its last retire cycle */
 static uint32_t g_rtl_psr = 0, g_rtl_wim = 0;
 static bool g_rtl_sregs_valid = false;
+/* l1i.sv: an L1I line fill against memory (the checker's, ss, and the RTL
+ * image, s); bus word k is the 4 bytes at line+4k as stored (top.cc's) */
+extern "C" void l1i_fill_chk(long long pa, int w0, int w1, int w2, int w3, int way, int idx) {
+  static uint64_t n_bad = 0;
+  if((ss == nullptr) or (static_cast<uint64_t>(pa) + 16 > ss->ram_size)) {
+    return;                    /* a PROM fill (boot mode): not in either image */
+  }
+  const uint32_t w[4] = {static_cast<uint32_t>(w0), static_cast<uint32_t>(w1), static_cast<uint32_t>(w2), static_cast<uint32_t>(w3)};
+  bool bad = false;
+  for(int k = 0; k < 4; k++) {
+    if(w[k] != ss->mem.get<uint32_t>(static_cast<uint64_t>(pa) + 4*k)) {
+      bad = true;
+    }
+  }
+  if(bad and (n_bad++ < 40)) {
+    std::cout << "[L1IFILL] pa " << std::hex << pa << " way " << way << " idx " << idx << " rtl";
+    for(int k = 0; k < 4; k++) {
+      std::cout << " " << w[k];
+    }
+    std::cout << " iss";
+    for(int k = 0; k < 4; k++) {
+      std::cout << " " << ss->mem.get<uint32_t>(static_cast<uint64_t>(pa) + 4*k);
+    }
+    std::cout << " rtlimg";
+    for(int k = 0; k < 4; k++) {
+      std::cout << " " << s->mem.get<uint32_t>(static_cast<uint64_t>(pa) + 4*k);
+    }
+    std::cout << std::dec << "\n";
+  }
+}
 extern "C" void rtl_sregs(int psr, int wim) {
   g_rtl_psr = static_cast<uint32_t>(psr);
   g_rtl_wim = static_cast<uint32_t>(wim);
@@ -256,7 +286,7 @@ static void checker_system_reset(state_t *st) {
   st->y = 0;
   st->fsr = 0;
   st->fq_addr = st->fq_insn = 0;
-  st->mmu_ctrl = (st->mmu_ctrl & ~(MCR_E | MCR_NF)) | MCR_BMODE;
+  st->mmu_ctrl = MCR_RESET | MCR_BMODE;   /* mmu.sv's sys_reset value (ss10sim system_reset) */
   st->pc = 0;
   st->npc = 4;
   st->error_mode = false;
@@ -1601,6 +1631,9 @@ int main(int argc, char **argv) {
       if(tb->dev_tap_valid) {
 	rtl_dev_tap(tb.get());
       }
+      /* the C++ devices reset in the cycle the RTL's do (below): acknowledge
+       * every system reset at once (on the board the ARM writes it, 0x34) */
+      tb->sys_reset_ack = tb->sys_reset_cnt;
       if(tb->sim_sys_reset) {
 	/* the RTL devices come out of reset next cycle; so do the C++ ones */
 	std::cout << "system reset at cycle " << g_clock_cycle << ", icnt " << ss->icnt << "\n";
