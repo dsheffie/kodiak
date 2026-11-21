@@ -434,7 +434,20 @@ static void rtl_dev_check(uint64_t pa, uint32_t size, uint32_t v) {
   }
 }
 
+/* -c 0: no checker retires the device stores, so nothing feeds the window's C++
+ * models (replay_dev::write does with the checker): the RTL's stores do */
+static bool g_checker_on = true;
+
 static void rtl_dev_write(uint64_t pa, uint32_t size, uint32_t v) {
+  if(not g_checker_on) {
+    bool be = false;
+    board_catch_up();
+    g_board->write(ss, pa, size, v, &be);
+    if(pa == 0xff1100006ULL and size == 1) {
+      ttya_out(static_cast<uint8_t>(v));
+    }
+    return;
+  }
   const int q = rtl_dev_pa(pa) ? 1 : 0;
   if(g_replay.writes[q].empty()) {
     /* ahead of the checker (an atomic): compared when the checker stores */
@@ -1430,6 +1443,7 @@ int main(int argc, char **argv) {
   ss->user_emu = user;
   initState(s);
   initState(ss);
+  g_checker_on = enable_checker;
 #ifdef STORE_CHECK
   g_store_check = enable_checker;
 #endif
@@ -1897,7 +1911,9 @@ int main(int argc, char **argv) {
     }
 
     ++last_retire;
-    if(g_board and g_board->cpu_halted) {
+    /* a halted CPU, or a cache flush (a whole-L2 flush walks every line, which
+     * can take longer than the limit below), is not a hang */
+    if((g_board and g_board->cpu_halted) or tb->in_flush_mode) {
       last_retire = 0;
     }
     if(last_retire > (1U<<16) && not(tb->in_flush_mode)) {
