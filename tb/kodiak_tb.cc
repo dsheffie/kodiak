@@ -345,8 +345,11 @@ struct dev_rec_t {
 /* the RTL's device store vs the checker's: normally the checker retires the
  * store first and the RTL's reaches the device later, but an atomic (ldstub,
  * swap) does its device read-modify-write before it retires, so its store can
- * come first: it waits here for the checker's */
-static std::deque<dev_rec_t> g_rtl_early_writes;
+ * come first: it waits here for the checker's.  Each path keeps its own order:
+ * a store to an RTL device takes effect at once, while a window store is posted
+ * to the ARM's ring, so an RTL device store can overtake earlier window stores
+ * (index: rtl_dev_pa) */
+static std::deque<dev_rec_t> g_rtl_early_writes[2];
 static void dev_write_compare(const dev_rec_t &rtl, const dev_rec_t &chk) {
   if(chk.pa != rtl.pa or chk.size != rtl.size or chk.v != rtl.v) {
     std::cout << "DEVICE DESYNC: the RTL writes " << rtl.size << " bytes = " << std::hex << rtl.v << " at pa " << rtl.pa
@@ -360,7 +363,8 @@ static void dev_write_compare(const dev_rec_t &rtl, const dev_rec_t &chk) {
  * here (at retirement, as in ss10sim) and wait for the RTL's to compare */
 class replay_dev : public dev_if {
 public:
-  std::deque<dev_rec_t> reads, writes;
+  std::deque<dev_rec_t> reads;
+  std::deque<dev_rec_t> writes[2];   /* window, RTL device (rtl_dev_pa) */
   uint32_t read(state_t *st, uint64_t pa, uint32_t size, bool *bus_error) override {
     if(dev_plain(pa)) {
       return g_board->read(st, pa, size, bus_error);
@@ -392,12 +396,13 @@ public:
     if(pa == 0xff1100006ULL and size == 1) {
       ttya_out(static_cast<uint8_t>(v));
     }
-    if(not g_rtl_early_writes.empty()) {
-      dev_write_compare(g_rtl_early_writes.front(), dev_rec_t{pa, size, v, *bus_error});
-      g_rtl_early_writes.pop_front();
+    const int q = rtl_dev_pa(pa) ? 1 : 0;
+    if(not g_rtl_early_writes[q].empty()) {
+      dev_write_compare(g_rtl_early_writes[q].front(), dev_rec_t{pa, size, v, *bus_error});
+      g_rtl_early_writes[q].pop_front();
       return;
     }
-    writes.push_back(dev_rec_t{pa, size, v, *bus_error});
+    writes[q].push_back(dev_rec_t{pa, size, v, *bus_error});
   }
 };
 static replay_dev g_replay;
@@ -430,13 +435,14 @@ static void rtl_dev_check(uint64_t pa, uint32_t size, uint32_t v) {
 }
 
 static void rtl_dev_write(uint64_t pa, uint32_t size, uint32_t v) {
-  if(g_replay.writes.empty()) {
+  const int q = rtl_dev_pa(pa) ? 1 : 0;
+  if(g_replay.writes[q].empty()) {
     /* ahead of the checker (an atomic): compared when the checker stores */
-    g_rtl_early_writes.push_back(dev_rec_t{pa, size, v, false});
+    g_rtl_early_writes[q].push_back(dev_rec_t{pa, size, v, false});
   }
   else {
-    dev_write_compare(dev_rec_t{pa, size, v, false}, g_replay.writes.front());
-    g_replay.writes.pop_front();
+    dev_write_compare(dev_rec_t{pa, size, v, false}, g_replay.writes[q].front());
+    g_replay.writes[q].pop_front();
   }
   if(rtl_dev_pa(pa)) {
     /* the RTL device took the store this cycle: so does its C++ model */
@@ -1901,7 +1907,7 @@ int main(int argc, char **argv) {
 		<< "\ncore state " << static_cast<int>(tb->core_state)
 		<< ", rob head pc " << std::hex << tb->dbg_head_pc << " status " << static_cast<int>(tb->dbg_head_status) << std::dec
 		<< ", checker pc " << std::hex << ss->pc << std::dec << " irl " << ss->irl << " pil " << ss->pil << " et " << ss->et
-		<< ", lsu device reads queued " << g_replay.reads.size() << " writes " << g_replay.writes.size()
+		<< ", lsu device reads queued " << g_replay.reads.size() << " writes " << (g_replay.writes[0].size() + g_replay.writes[1].size())
 		<< ", l1i state " << static_cast<int>(tb->l1i_state) << " l1d state " << static_cast<int>(tb->l1d_state) << "\n";
       break;
     }

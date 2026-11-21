@@ -10,7 +10,7 @@ UNAME_S = $(shell uname -s)
 SDS = ../superdupersparc
 RTL = ../rtl
 
-DEV_OBJ = sun4m.o esp.o scsi.o lance.o tcx.o cg14.o
+DEV_OBJ = sun4m.o esp.o scsi.o lance.o dbri.o tcx.o cg14.o
 OBJ = kodiak_tb.o verilated.o verilated_vcd_c.o loadelf.o interpret.o $(DEV_OBJ) disassemble.o helper.o sparse_mem.o ckpt.o
 
 SV_SRC = $(wildcard $(RTL)/*.sv) $(wildcard $(SDS)/*.sv) $(wildcard $(SDS)/*.vh)
