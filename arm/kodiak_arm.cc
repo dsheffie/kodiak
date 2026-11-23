@@ -9,6 +9,8 @@
  *
  * DRAM (the 496 MB the kernel reserves, base = S00 write 0x06, mask = write 0x08):
  *   0x00000000  guest RAM (kodiak_soc's RAM_BYTES, 256 MB)
+ *   0x1c000000  the CG14's VRAM, 8 MB (kodiak_soc sends VRAM to memory; --fb-dump
+ *               copies it out in bulk)
  *   0x1d000000  the boot PROM, 1 MB (OBP is loaded here)
  *   0x1e000000  the window's staging region (16 MB, to the end)
  *
@@ -30,6 +32,7 @@
 #include <string>
 #include <vector>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <poll.h>
 #include <termios.h>
 #include <unistd.h>
@@ -42,6 +45,8 @@
 #include "sun4m.hh"
 #include "scsi.hh"
 #include "tcx.hh"
+#include "keymap.hh"
+#include <deque>
 #include "win_service.h"
 
 namespace po = boost::program_options;
@@ -63,6 +68,7 @@ static const uint64_t DRAM_SIZE = 496ULL << 20;    /* reserved by the kernel (as
 						    * never touch past it -- that is kernel memory */
 static const uint64_t RAM_BYTES = 256ULL << 20;
 static const uint64_t PROM_OFF = 0x1d000000ULL;
+static const uint64_t VRAM_OFF = 0x1c000000ULL;   /* the AXI wrapper's VRAM fold */
 
 static Driver *g_d = nullptr;
 static uint8_t *g_dram = nullptr;
@@ -92,6 +98,8 @@ static dev_stat_t g_dev_stats[] = {
   {"esp",       0xef0800000ULL, 0xef0800040ULL, 0, 0, 0, 0, 0, 0},
   {"lance",     0xef0c00000ULL, 0xef0c00004ULL, 0, 0, 0, 0, 0, 0},
   {"tcx",       tcx_t::BASE, tcx_t::BASE + tcx_t::SPAN, 0, 0, 0, 0, 0, 0},
+  {"cg14-regs", cg14_t::REG_BASE, cg14_t::REG_BASE + cg14_t::REG_SPAN, 0, 0, 0, 0, 0, 0},
+  {"cg14-vram", cg14_t::VRAM_BASE, cg14_t::VRAM_BASE + cg14_t::VRAM_SPAN, 0, 0, 0, 0, 0, 0},
   {"other",     0, ~0ULL, 0, 0, 0, 0, 0, 0},
 };
 static const uint64_t STAT_PERIOD_NS = 30ULL * 1000000000ULL;
@@ -104,6 +112,137 @@ static dev_stat_t *dev_stat(uint64_t pa) {
   return d;
 }
 #endif
+
+static uint64_t mono_ns();
+
+/* --fb-dump: the board has no display, so the screen goes to a PPM file (written
+ * to FILE.tmp and renamed, so a reader never sees half a frame) */
+static const uint64_t FB_DUMP_NS = 5ULL * 1000000000ULL;
+static void write_ppm(const framebuffer_t *fb, const std::string &path) {
+  const uint32_t w = fb->width(), h = fb->height();
+  if(w == 0 or h == 0) {
+    return;
+  }
+  std::vector<uint32_t> px(static_cast<size_t>(w) * h);
+  fb->render(px.data());
+  const std::string tmp = path + ".tmp";
+  FILE *fp = fopen(tmp.c_str(), "wb");
+  if(fp == nullptr) {
+    return;
+  }
+  fprintf(fp, "P6\n%u %u\n255\n", w, h);
+  std::vector<uint8_t> row(static_cast<size_t>(w) * 3);
+  for(uint32_t y = 0; y < h; y++) {
+    for(uint32_t x = 0; x < w; x++) {
+      const uint32_t v = px[static_cast<size_t>(y) * w + x];
+      row[3 * x + 0] = (v >> 16) & 0xff;
+      row[3 * x + 1] = (v >> 8) & 0xff;
+      row[3 * x + 2] = v & 0xff;
+    }
+    fwrite(row.data(), 1, row.size(), fp);
+  }
+  fclose(fp);
+  rename(tmp.c_str(), path.c_str());
+}
+
+/* the Sun keyboard (a framebuffer without --no-kbd): ASCII as key events, keycode |
+ * 0x80 = release, as ss10sim --kbd-input; ^A-^Z are Control + the letter */
+/* one keyboard or mouse event: a Sun keycode (| 0x80 = release), or mouse motion
+ * (y down positive) with the button state (bit 2 left, 1 middle, 0 right) */
+struct input_ev_t {
+  bool mouse;
+  uint8_t key;
+  int32_t dx, dy;
+  uint8_t buttons;
+};
+static void push_key(std::deque<input_ev_t> *q, uint8_t k) {
+  q->push_back({false, k, 0, 0, 0});
+}
+static void ascii_to_keys(int c, std::deque<input_ev_t> *keys) {
+  const uint8_t sun_shift = usb_to_sun(0xe1), sun_ctrl = usb_to_sun(0xe0);
+  if(c >= 1 and c <= 26 and c != '\t' and c != '\n' and c != '\r') {
+    const uint8_t k = usb_to_sun(0x04 + (c - 1));
+    push_key(keys, sun_ctrl);
+    push_key(keys, k);
+    push_key(keys, k | 0x80);
+    push_key(keys, sun_ctrl | 0x80);
+    return;
+  }
+  bool shift = false;
+  const uint8_t k = usb_to_sun(ascii_to_usb(static_cast<char>((c == '\r') ? '\n' : c), &shift));
+  if(k == 0) {
+    return;
+  }
+  if(shift) {
+    push_key(keys, sun_shift);
+  }
+  push_key(keys, k);
+  push_key(keys, k | 0x80);
+  if(shift) {
+    push_key(keys, sun_shift | 0x80);
+  }
+}
+
+/* --input-fifo: one command per line --
+ *   type TEXT      TEXT on the keyboard (\n = Return)
+ *   meta C         Meta (NeXTSTEP's Command) + C
+ *   ctrl C         Control + C
+ *   move DX DY     mouse motion, in steps of at most 8 so the OS's acceleration
+ *                  stays out of it (y down positive)
+ *   home           far up and left: the cursor parks in the top-left corner
+ *   down | up | click   the left button */
+static void input_command(const std::string &line, std::deque<input_ev_t> *q, uint8_t *buttons) {
+  const size_t sp = line.find(' ');
+  const std::string cmd = line.substr(0, sp);
+  const std::string arg = (sp == std::string::npos) ? "" : line.substr(sp + 1);
+  if(cmd == "type") {
+    for(size_t i = 0; i < arg.size(); i++) {
+      if(arg[i] == '\\' and i + 1 < arg.size() and arg[i + 1] == 'n') {
+	ascii_to_keys('\n', q);
+	i++;
+      }
+      else {
+	ascii_to_keys(static_cast<uint8_t>(arg[i]), q);
+      }
+    }
+  }
+  else if((cmd == "meta" or cmd == "ctrl") and not arg.empty()) {
+    const uint8_t mod = usb_to_sun((cmd == "meta") ? 0xe3 : 0xe0);
+    bool shift = false;
+    const uint8_t k = usb_to_sun(ascii_to_usb(arg[0], &shift));
+    push_key(q, mod);
+    push_key(q, k);
+    push_key(q, k | 0x80);
+    push_key(q, mod | 0x80);
+  }
+  else if(cmd == "move" or cmd == "home") {
+    int32_t dx = -4000, dy = -4000;
+    if(cmd == "move" and sscanf(arg.c_str(), "%d %d", &dx, &dy) != 2) {
+      fprintf(stderr, "kodiak_arm: input-fifo: bad move '%s'\n", arg.c_str());
+      return;
+    }
+    while(dx != 0 or dy != 0) {
+      const int32_t sx = std::max(-8, std::min(8, dx)), sy = std::max(-8, std::min(8, dy));
+      q->push_back({true, 0, sx, sy, *buttons});
+      dx -= sx;
+      dy -= sy;
+    }
+  }
+  else if(cmd == "down" or cmd == "up" or cmd == "click") {
+    if(cmd != "up") {
+      *buttons |= 4;
+      q->push_back({true, 0, 0, 0, *buttons});
+    }
+    if(cmd != "down") {
+      *buttons &= ~4;
+      q->push_back({true, 0, 0, 0, *buttons});
+    }
+  }
+  else if(not cmd.empty()) {
+    fprintf(stderr, "kodiak_arm: input-fifo: unknown command '%s'\n", line.c_str());
+  }
+}
+static const uint64_t KBD_EVENT_NS = 20ULL * 1000000ULL;   /* one key event per 20 ms */
 
 static uint64_t mono_ns() {
   struct timespec ts;
@@ -249,7 +388,10 @@ static bool attach_scsi(sun4m_t *m, const std::vector<std::string> &specs, scsi_
 }
 
 int main(int argc, char *argv[]) {
-  std::string rom, nvram, tcx_rom;
+  std::string rom, nvram, tcx_rom, fb_dump, kbd_input, input_fifo;
+  uint64_t kbd_input_after = 0;
+  bool cg14 = false;
+  uint32_t cg14_depth = 0;
   std::vector<std::string> scsi_disks, scsi_cdroms;
   uint64_t control = 0xa0050000ULL;   /* the BD address of the axi_is_the_worst slave */
   bool no_kbd = false;
@@ -262,7 +404,13 @@ int main(int argc, char *argv[]) {
       ("rom,r", po::value<std::string>(&rom)->required(), "SS-20 boot PROM image (OBP 2.25R)")
       ("nvram", po::value<std::string>(&nvram), "M48T08 NVRAM image")
       ("tcx", po::value<std::string>(&tcx_rom), "a TCX framebuffer, with this FCode PROM")
+      ("cg14", po::bool_switch(&cg14), "a CG14 (SX) framebuffer on an 8 MB VSIMM in slot 3 (what NeXTSTEP drives on an SS-20)")
+      ("cg14-depth", po::value<uint32_t>(&cg14_depth), "with --cg14: show the VRAM as 8 or 32 (XBGR) bits per pixel whatever the MCR says (NeXTSTEP: 32)")
+      ("fb-dump", po::value<std::string>(&fb_dump), "with --tcx/--cg14: write the screen to this PPM file every few seconds when it changes (the board has no display)")
       ("no-kbd", po::bool_switch(&no_kbd), "no keyboard: the console is ttya")
+      ("kbd-input", po::value<std::string>(&kbd_input), "with --tcx/--cg14 and a keyboard: a file typed on the Sun keyboard (ASCII, US layout; \\n is Return, ^A-^Z are Control+letter)")
+      ("kbd-input-after", po::value<uint64_t>(&kbd_input_after), "with --kbd-input: start typing this many seconds after the core starts")
+      ("input-fifo", po::value<std::string>(&input_fifo), "with a keyboard: a FIFO (made if missing) of keyboard/mouse commands, one per line: type TEXT, meta C, ctrl C, move DX DY, home, down, up, click")
       ("scsi-disk", po::value<std::vector<std::string>>(&scsi_disks), "[ID:]image: a SCSI disk")
       ("scsi-cdrom", po::value<std::vector<std::string>>(&scsi_cdroms), "[ID:]image: a SCSI CD-ROM")
       ("control", po::value<uint64_t>(&control), "physical address of the S00_AXI registers")
@@ -296,9 +444,18 @@ int main(int argc, char *argv[]) {
       fprintf(stderr, "kodiak_arm: cannot read the TCX FCode %s\n", tcx_rom.c_str());
       return 1;
     }
+  }
+  if(cg14) {
+    board->cg14 = new cg14_t();
+    board->cg14->depth_override = cg14_depth;
+  }
+  if(board->tcx != nullptr or board->cg14 != nullptr) {
     board->have_kbd = not no_kbd;
     board->reset_devices(0);
   }
+  /* the framebuffer --fb-dump shows: the CG14 if there is one */
+  framebuffer_t *fb = (board->cg14 != nullptr) ? static_cast<framebuffer_t *>(board->cg14) :
+    static_cast<framebuffer_t *>(board->tcx);
   if(not attach_scsi(board, scsi_disks, scsi_dev_t::type_t::disk, 0) or
      not attach_scsi(board, scsi_cdroms, scsi_dev_t::type_t::cdrom, 6)) {
     return 1;
@@ -396,6 +553,41 @@ int main(int argc, char *argv[]) {
   }
   uint32_t irq = 0;
   uint64_t iter = 0;
+  uint64_t fb_dump_t0 = mono_ns(), fb_dump_gen = ~0ULL;
+  /* the keyboard: stdin (and --kbd-input) go to it instead of ttya */
+  const bool kbd = board->have_kbd;
+  std::deque<input_ev_t> kbd_keys;
+  uint8_t mouse_buttons = 0;
+  int fifo_fd = -1;
+  std::string fifo_line;
+  if(not input_fifo.empty()) {
+    if(not kbd) {
+      fprintf(stderr, "kodiak_arm: --input-fifo needs --tcx or --cg14 (no --no-kbd)\n");
+      return 1;
+    }
+    mkfifo(input_fifo.c_str(), 0600);
+    fifo_fd = open(input_fifo.c_str(), O_RDONLY | O_NONBLOCK);
+    /* a writer of our own, so the FIFO never reads as EOF between commands */
+    if(fifo_fd < 0 or open(input_fifo.c_str(), O_WRONLY | O_NONBLOCK) < 0) {
+      fprintf(stderr, "kodiak_arm: cannot open --input-fifo %s\n", input_fifo.c_str());
+      return 1;
+    }
+  }
+  std::string kbd_file;
+  if(not kbd_input.empty()) {
+    FILE *kf = fopen(kbd_input.c_str(), "rb");
+    if(kf == nullptr or not kbd) {
+      fprintf(stderr, "kodiak_arm: --kbd-input needs --tcx or --cg14 (no --no-kbd) and a readable %s\n", kbd_input.c_str());
+      return 1;
+    }
+    for(int c = fgetc(kf); c != EOF; c = fgetc(kf)) {
+      kbd_file.push_back(static_cast<char>(c));
+    }
+    fclose(kf);
+  }
+  const uint64_t kbd_file_at = mono_ns() + kbd_input_after * 1000000000ULL;
+  uint64_t kbd_next_ns = 0;
+  std::vector<uint8_t> fb_last;   /* the CG14 VRAM as last dumped */
 #ifdef ENABLE_WIN_STATS
   /* REG_INSNS is 32 bits: accumulate deltas (a period is far under 2^32 insns) */
   uint32_t last_insns = g_d->read32(REG_INSNS);
@@ -417,6 +609,25 @@ int main(int argc, char *argv[]) {
       board->timer_event(s);
     }
     if((++iter & 255) == 0) {
+      if(fb != nullptr and not fb_dump.empty() and (mono_ns() - fb_dump_t0) >= FB_DUMP_NS) {
+	fb_dump_t0 = mono_ns();
+	/* the CG14's VRAM is in DRAM (the core's stores never come here): copy it in
+	 * bulk into the model, which then renders it.  A line still dirty in the
+	 * core's caches shows up a dump or so late. */
+	bool changed = (fb->gen != fb_dump_gen);
+	if(board->cg14 != nullptr) {
+	  std::vector<uint8_t> &vram = board->cg14->vram;
+	  memcpy(vram.data(), g_dram + VRAM_OFF, cg14_t::VRAM_SIZE);
+	  if(fb_last != vram) {
+	    fb_last = vram;
+	    changed = true;
+	  }
+	}
+	if(changed) {
+	  fb_dump_gen = fb->gen;
+	  write_ppm(fb, fb_dump);
+	}
+      }
       /* a system reset by the RTL's sequencer: the devices here reset too, and
        * the core stays in reset until we say so (kodiak_soc.sv RESUME_WAIT) */
       const uint32_t n = g_d->read32(REG_SYS_RESETS);
@@ -428,7 +639,52 @@ int main(int argc, char *argv[]) {
 	printf("\nkodiak_arm: system reset\n");
       }
       struct pollfd pfd = {0, POLLIN, 0};
-      if(board->serial.can_receive(1) and poll(&pfd, 1, 0) > 0) {
+      if(kbd) {
+	if(poll(&pfd, 1, 0) > 0) {
+	  uint8_t ch;
+	  if(read(0, &ch, 1) == 1) {
+	    ascii_to_keys(ch, &kbd_keys);
+	  }
+	}
+	const uint64_t now = mono_ns();
+	if(not kbd_file.empty() and now >= kbd_file_at) {
+	  for(char c : kbd_file) {
+	    ascii_to_keys(static_cast<uint8_t>(c), &kbd_keys);
+	  }
+	  kbd_file.clear();
+	}
+	if(fifo_fd >= 0) {
+	  char buf[256];
+	  const ssize_t n = read(fifo_fd, buf, sizeof(buf));
+	  for(ssize_t i = 0; i < n; i++) {
+	    if(buf[i] == '\n') {
+	      input_command(fifo_line, &kbd_keys, &mouse_buttons);
+	      fifo_line.clear();
+	    }
+	    else {
+	      fifo_line.push_back(buf[i]);
+	    }
+	  }
+	}
+	/* one event per KBD_EVENT_NS, each when its channel (A keyboard, B mouse,
+	 * chn[0]) has drained */
+	if(not kbd_keys.empty() and now >= kbd_next_ns) {
+	  const input_ev_t e = kbd_keys.front();
+	  if(e.mouse and board->kbd_ms.chn[0].queue.empty()) {
+	    kbd_keys.pop_front();
+	    board->kbd_ms.mouse_event(e.dx, e.dy, e.buttons);
+	    board->update_irqs(s);
+	    kbd_next_ns = now + KBD_EVENT_NS;
+	  }
+	  else if(not e.mouse and board->kbd_ms.kbd_idle()) {
+	    kbd_keys.pop_front();
+	    board->kbd_ms.kbd_event(e.key & 0x7f, not (e.key & 0x80));
+	    board->update_irqs(s);
+	    kbd_next_ns = now + KBD_EVENT_NS;
+	  }
+	}
+      }
+      else if(board->serial.can_receive(1) and poll(&pfd, 1, 0) > 0) {
 	uint8_t ch;
 	if(read(0, &ch, 1) == 1) {
 	  board->serial.receive(1, (ch == '\n') ? '\r' : ch);

@@ -647,12 +647,17 @@ module axi_is_the_worst_v1_0 #
    // DRAM layout (offsets from base, write 0x06, in the 496 MB the kernel reserves;
    // mask, write 0x08, = 496 MB - 1):
    //   0x00000000  guest RAM, pa = offset (kodiak_soc's RAM_BYTES, 256 MB)
+   //   0x1c000000  the CG14's VRAM, 8 MB (the ARM copies the screen out), pa 0xfc000000
+   //               + 64 MB, aliasing every 8 MB (OBP sizes the VRAM by the alias)
    //   0x1d000000  the boot PROM, 1 MB (the ARM loads OBP here), pa 0xff00xxxxx
    //   0x1e000000  the window's staging region (prod at +0x60, the ring at +0x200000)
-   // so the lane-0 fold below maps the PROM; RAM and the staging region pass through.
+   // so the lane-0 fold below maps the VRAM and the PROM; RAM and the staging region
+   // pass through.
    wire [35:0] w_soc_mem_req_addr;
    assign w_mem_req_addr = (w_soc_mem_req_addr[35:20] == 16'hff00) ?
-			   {16'h01d0, w_soc_mem_req_addr[19:0]} : w_soc_mem_req_addr;
+			   {16'h01d0, w_soc_mem_req_addr[19:0]} :
+			   (w_soc_mem_req_addr[35:26] == 10'h03f) ?
+			   {13'h0038, w_soc_mem_req_addr[22:0]} : w_soc_mem_req_addr;
    wire w_snoop_req_valid, w_snoop_req_ack, w_snoop_req_wbinv, w_snoop_done;
    wire [35:0] w_snoop_req_addr;
 

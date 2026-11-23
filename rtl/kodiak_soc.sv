@@ -502,7 +502,13 @@ module kodiak_soc #(parameter logic [35:0] RAM_BYTES = 36'h10000000)   /* instal
     * device goes to the ARM-served window */
    wire w_is_ram = (c_req_addr < `PA_WIDTH'(RAM_BYTES));
    wire w_is_prom = (c_req_addr[`PA_WIDTH-1:20] == 16'hff00);
-   wire w_is_win = !w_is_ram & !w_is_prom & !w_is_dev;
+   /* the CG14's VRAM (VSIMM slot 3: 0xfc000000, 64 MB, an 8 MB VRAM aliasing through
+    * it) is plain memory: it goes to the memory bus like the PROM (the AXI wrapper
+    * folds it onto 8 MB of DRAM, where the ARM copies the screen out in bulk), not
+    * a 32-bit-at-a-time trip through the window.  The CG14's registers stay on the
+    * window. */
+   wire w_is_vram = (c_req_addr[`PA_WIDTH-1:26] == 10'h03f);
+   wire w_is_win = !w_is_ram & !w_is_prom & !w_is_vram & !w_is_dev;
 
    // =====================================================================
    //  Device request FSM (Henry's): one request outstanding, as on the core
@@ -724,7 +730,7 @@ module kodiak_soc #(parameter logic [35:0] RAM_BYTES = 36'h10000000)   /* instal
    logic [127:0] n_at_rdata;
    logic t_at_done;
    logic t_at_bad;
-   wire w_mem_sel = c_req_valid & (w_is_ram | w_is_prom) & !w_sr_core_reset;
+   wire w_mem_sel = c_req_valid & (w_is_ram | w_is_prom | w_is_vram) & !w_sr_core_reset;
    wire w_mem_atomic = (c_req_opcode == 5'd8) | (c_req_opcode == 5'd9);
 
    always_comb
