@@ -1604,6 +1604,7 @@ int main(int argc, char **argv) {
   globals::cycle = 0;
 
   tb->single_step = 0;
+  tb->pmu_sel = 0;
   tb->step = 0;
   double t0 = timestamp();
   bool irq_pending = false;

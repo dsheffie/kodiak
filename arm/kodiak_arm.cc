@@ -60,6 +60,8 @@ enum {
   /* debug readback */
   REG_STATUS = 0x03, REG_LAST_PC = 0x07, REG_LAST_ADDR = 0x09, REG_INSNS = 0x28,
   REG_WIN_HELD = 0x21,   /* {held load pending, its recno[30:0]} */
+  /* HW_TOPDOWN counters: write {high half, counter} to 0x24, read that half at 0x02 */
+  REG_PMU_SEL = 0x24, REG_PMU_DATA = 0x02,
 };
 static const uint32_t CTRL_RESET = 1u << 0, CTRL_RESUME = 1u << 1;
 static const uint32_t STATUS_READY = 1u << 0;   /* ready_for_resume */
@@ -71,6 +73,87 @@ static const uint64_t PROM_OFF = 0x1d000000ULL;
 static const uint64_t VRAM_OFF = 0x1c000000ULL;   /* the AXI wrapper's VRAM fold */
 
 static Driver *g_d = nullptr;
+
+/* --pmu: the core's HW_TOPDOWN counters (superdupersparc core.sv, core_l1d_l1i.sv),
+ * snapshotted when the console prints a C95_BEGIN / UB_BEGIN line and printed as
+ * deltas at the matching *_END line.  The counters are 48 bits wide. */
+static const int N_PMU = 22;
+static const char *const g_pmu_names[N_PMU] = {
+  "cycles", "retired", "allocated", "fe_lat", "fe_bw",
+  "be_rob_full", "be_uq_full", "be_freelist", "be_oldest_first", "be_pending_fault",
+  "be_other", "be_pairing", "not_active", nullptr, nullptr, nullptr,
+  "l1i_acc", "l1i_hit", "l1d_acc", "l1d_hit", "l2_acc", "l2_hit"
+};
+static uint64_t g_pmu_start[N_PMU];
+static std::string g_pmu_tag;
+
+static uint32_t pmu_half(int i, bool hi) {
+  g_d->write32(REG_PMU_SEL, static_cast<uint32_t>(i) | (hi ? 0x20u : 0u));
+  /* the select and the value each cross two flop stages: a first read covers them */
+  g_d->read32(REG_PMU_DATA);
+  return g_d->read32(REG_PMU_DATA);
+}
+
+static uint64_t pmu_read(int i) {
+  for(;;) {
+    const uint32_t hi0 = pmu_half(i, true);
+    const uint32_t lo = pmu_half(i, false);
+    const uint32_t hi1 = pmu_half(i, true);
+    if(hi0 == hi1) {
+      return (static_cast<uint64_t>(hi1) << 32) | lo;
+    }
+  }
+}
+
+static void pmu_snapshot(uint64_t v[N_PMU]) {
+  for(int i = 0; i < N_PMU; i++) {
+    v[i] = (g_pmu_names[i] != nullptr) ? pmu_read(i) : 0;
+  }
+}
+
+static bool starts_with(const std::string &s, const char *p) {
+  return s.compare(0, strlen(p), p) == 0;
+}
+
+static void pmu_line(const std::string &line) {
+  if(starts_with(line, "C95_BEGIN") or starts_with(line, "UB_BEGIN")) {
+    g_pmu_tag = line;
+    pmu_snapshot(g_pmu_start);
+    return;
+  }
+  if(not (starts_with(line, "C95_END") or starts_with(line, "UB_END")) or g_pmu_tag.empty()) {
+    return;
+  }
+  uint64_t now[N_PMU], d[N_PMU];
+  pmu_snapshot(now);
+  for(int i = 0; i < N_PMU; i++) {
+    d[i] = now[i] - g_pmu_start[i];
+  }
+  /* slots: 2 per ACTIVE cycle */
+  const double slots = 2.0 * static_cast<double>(d[0] - d[12]);
+  const uint64_t be = d[5] + d[6] + d[7] + d[8] + d[9] + d[10] + d[11];
+  printf("\nPMU %s: cycles=%llu retired=%llu ipc=%.3f | slots: alloc %.1f%% fe_lat %.1f%% fe_bw %.1f%% be %.1f%%"
+	 " (rob %.1f%% uq %.1f%% fl %.1f%% other %.1f%%) | not_active %.1f%% of cycles"
+	 " | l1i miss %llu l1d miss %llu l2 miss %llu\n",
+	 g_pmu_tag.c_str() + (starts_with(g_pmu_tag, "UB") ? 0 : 10),
+	 static_cast<unsigned long long>(d[0]), static_cast<unsigned long long>(d[1]),
+	 d[0] ? static_cast<double>(d[1]) / d[0] : 0.0,
+	 100.0 * d[2] / slots, 100.0 * d[3] / slots, 100.0 * d[4] / slots, 100.0 * be / slots,
+	 100.0 * d[5] / slots, 100.0 * d[6] / slots, 100.0 * d[7] / slots,
+	 100.0 * (d[8] + d[9] + d[10] + d[11]) / slots,
+	 d[0] ? 100.0 * d[12] / d[0] : 0.0,
+	 static_cast<unsigned long long>(d[16] - d[17]), static_cast<unsigned long long>(d[18] - d[19]),
+	 static_cast<unsigned long long>(d[20] - d[21]));
+  printf("PMU_RAW %s:", g_pmu_tag.c_str());
+  for(int i = 0; i < N_PMU; i++) {
+    if(g_pmu_names[i] != nullptr) {
+      printf(" %s=%llu", g_pmu_names[i], static_cast<unsigned long long>(d[i]));
+    }
+  }
+  printf("\n");
+  fflush(stdout);
+  g_pmu_tag.clear();
+}
 static uint8_t *g_dram = nullptr;
 static uint32_t g_snoop_seq = 0;
 static uint64_t g_snoops = 0;
@@ -397,6 +480,7 @@ int main(int argc, char *argv[]) {
   bool no_kbd = false;
   uint64_t scsi_cmd_us = 250;
   bool no_esp_timing = false;
+  bool pmu = false;
   try {
     po::options_description desc("Options");
     desc.add_options()
@@ -416,6 +500,7 @@ int main(int argc, char *argv[]) {
       ("control", po::value<uint64_t>(&control), "physical address of the S00_AXI registers")
       ("scsi-cmd-us", po::value<uint64_t>(&scsi_cmd_us), "a SCSI target's command overhead in us (default 250): the ESP's interrupt waits for it")
       ("no-esp-timing", po::bool_switch(&no_esp_timing), "the ESP interrupts as soon as the model finishes a command")
+      ("pmu", po::bool_switch(&pmu), "print the core's HW_TOPDOWN counters over each C95_BEGIN..C95_END / UB_BEGIN..UB_END console span")
       ;
     po::variables_map vm;
     po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -452,6 +537,9 @@ int main(int argc, char *argv[]) {
   if(board->tcx != nullptr or board->cg14 != nullptr) {
     board->have_kbd = not no_kbd;
     board->reset_devices(0);
+  }
+  if(pmu) {
+    board->serial.line_hook = pmu_line;
   }
   /* the framebuffer --fb-dump shows: the CG14 if there is one */
   framebuffer_t *fb = (board->cg14 != nullptr) ? static_cast<framebuffer_t *>(board->cg14) :

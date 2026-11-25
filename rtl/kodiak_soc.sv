@@ -21,6 +21,8 @@ module kodiak_soc #(parameter logic [35:0] RAM_BYTES = 36'h10000000)   /* instal
 		  reset,
 		  retire_allowed,
 		  single_step,
+		  pmu_sel,
+		  pmu_value,
 		  bp_enable,
 		  fault_clear,
 		  bp_pc,
@@ -162,6 +164,9 @@ module kodiak_soc #(parameter logic [35:0] RAM_BYTES = 36'h10000000)   /* instal
    input logic reset;
    input logic retire_allowed;
    input logic single_step;
+   /* HW_TOPDOWN counters (superdupersparc core_l1d_l1i): value follows select */
+   input logic [4:0] pmu_sel;
+   output logic [47:0] pmu_value;
    input logic bp_enable;
    input logic fault_clear;
    input logic [31:0] bp_pc;
@@ -352,6 +357,8 @@ module kodiak_soc #(parameter logic [35:0] RAM_BYTES = 36'h10000000)   /* instal
       .sys_reset(w_sr_core_reset),
       .retire_allowed(retire_allowed & !w_sr_hold),
       .single_step(single_step),
+      .pmu_sel(pmu_sel),
+      .pmu_value(pmu_value),
       .bp_enable(bp_enable),
       .fault_clear(fault_clear),
       .bp_pc(bp_pc),

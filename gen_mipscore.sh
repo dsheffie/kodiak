@@ -58,10 +58,11 @@ cp "$SUB"/convert_sv_to_v.py "$BUILD"/
 echo "[gen_mipscore] $(ls "$BUILD"/*.sv | wc -l) .sv + $(ls "$BUILD"/*.vh 2>/dev/null | wc -l) .vh -> sv2v"
 
 # Extra sv2v -D defines, injected at build time so the core submodule's
-# machine.vh can stay == origin/main.  None by default (the debug watchpoint is
-# off and its ports tie to 0).  Set them in the env:
-#   SV2V_DEFINES="ENABLE_DEBUG_WATCHPOINT FOO" ./gen_mipscore.sh
-: "${SV2V_DEFINES=}"
+# machine.vh can stay == origin/main.  The Kodiak configuration (ROB, schedulers,
+# L2 shape, L1D miss engines) is sv2v_defines in this directory: a build that
+# dropped it ran CINT95 ~20% slower (2026-11-25).  The env overrides the file:
+#   SV2V_DEFINES="$(cat sv2v_defines) ENABLE_DEBUG_WATCHPOINT" ./gen_mipscore.sh
+: "${SV2V_DEFINES=$(cat "$ROOT/sv2v_defines" 2>/dev/null)}"
 export SV2V_DEFINES
 echo "[gen_mipscore] sv2v extra defines: ${SV2V_DEFINES:-<none>}"
 ( cd "$BUILD" && python3 convert_sv_to_v.py )
