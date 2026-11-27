@@ -46,6 +46,7 @@ markdown_extensions:
 
 nav:
   - Overview: index.md
+  - "Getting a software stack (Solaris, SunOS, NeXTSTEP)": software-stack.md
   - Architecture: architecture.md
   - Minimum MMIO to boot banner: minimum-mmio-to-banner.md
   - CPU integration (r9999): cpu-integration.md
